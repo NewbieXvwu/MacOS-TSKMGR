@@ -586,6 +586,40 @@ enum AppleSiliconCoreTierMode {
     case singlePerformanceTier
 }
 
+extension AppleSiliconCoreTierMode {
+    func primaryDisplayName(in language: AppLanguage) -> String {
+        switch self {
+        case .performanceEfficiency, .singlePerformanceTier:
+            return language.text("性能核", "P-core")
+        case .superPerformance, .superEfficiency:
+            return language.text("超级核", "S-core")
+        case .genericPrimarySecondary:
+            return language.text("主核心", "Primary-core")
+        }
+    }
+
+    func secondaryDisplayName(in language: AppLanguage) -> String? {
+        switch self {
+        case .performanceEfficiency, .superEfficiency:
+            return language.text("能效核", "E-core")
+        case .superPerformance:
+            return language.text("性能核", "P-core")
+        case .genericPrimarySecondary:
+            return language.text("次核心", "Secondary-core")
+        case .singlePerformanceTier:
+            return nil
+        }
+    }
+
+    func combinedDisplayName(in language: AppLanguage) -> String {
+        let primaryDisplayName = primaryDisplayName(in: language)
+        guard let secondaryDisplayName = secondaryDisplayName(in: language) else {
+            return primaryDisplayName
+        }
+        return "\(primaryDisplayName)/\(secondaryDisplayName)"
+    }
+}
+
 struct CPUState {
     var modelName: String = "Apple Silicon"
     var utilizationPercent: Double = 0

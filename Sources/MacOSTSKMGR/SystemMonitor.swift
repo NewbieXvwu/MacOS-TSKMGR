@@ -630,6 +630,7 @@ final class SystemMonitor: ObservableObject {
     private var appHistoryMeteredNetworkBaseline: [Int32: UInt64] = [:]
     private var previousDiskCounters: [String: (read: UInt64, write: UInt64, readOps: UInt64, writeOps: UInt64, readTimeNs: UInt64, writeTimeNs: UInt64)] = [:]
     private var previousNetworkCounters: [String: (in: UInt64, out: UInt64)] = [:]
+    private var diskKindCache: [String: String] = [:]
     private var aneIOReportSampler: ANEIOReportSampler?
     private var lastSampleDate = Date()
     private let hostPort = mach_host_self()
@@ -1458,7 +1459,7 @@ final class SystemMonitor: ObservableObject {
                 userName: userName(for: info.uid),
                 cpuPercent: cpu,
                 memoryBytes: info.residentSize,
-                platform: processPlatform(flags: info.flags)
+                platform: processPlatform(flags: info.flags, processCPUType: info.processCPUType)
             )
         }
         .sorted { $0.memoryBytes > $1.memoryBytes }
@@ -1758,59 +1759,23 @@ final class SystemMonitor: ObservableObject {
     }
 
     private func primaryCoreSpeedLabel() -> String {
-        switch cpu.coreTierMode {
-        case .superPerformance:
-            return language.text("超级核基准速度", "S-core base speed")
-        case .superEfficiency:
-            return language.text("超级核基准速度", "S-core base speed")
-        case .genericPrimarySecondary:
-            return language.text("主核心基准速度", "Primary-core base speed")
-        case .performanceEfficiency, .singlePerformanceTier:
-            return language.text("性能核基准速度", "P-core base speed")
-        }
+        let label = cpu.coreTierMode.primaryDisplayName(in: language)
+        return language.text("\(label)基准速度", "\(label) base speed")
     }
 
     private func secondaryCoreSpeedLabel() -> String {
-        switch cpu.coreTierMode {
-        case .superPerformance:
-            return language.text("性能核基准速度", "Performance-core base speed")
-        case .performanceEfficiency:
-            return language.text("能效核基准速度", "E-core base speed")
-        case .superEfficiency:
-            return language.text("能效核基准速度", "E-core base speed")
-        case .genericPrimarySecondary:
-            return language.text("次核心基准速度", "Secondary-core base speed")
-        case .singlePerformanceTier:
-            return language.text("单层性能核基准速度", "Performance-core base speed")
-        }
+        let label = cpu.coreTierMode.secondaryDisplayName(in: language) ?? cpu.coreTierMode.primaryDisplayName(in: language)
+        return language.text("\(label)基准速度", "\(label) base speed")
     }
 
     private func primaryCoreTemperatureLabel() -> String {
-        switch cpu.coreTierMode {
-        case .superPerformance:
-            return language.text("超级核温度", "S-core temperature")
-        case .superEfficiency:
-            return language.text("超级核温度", "S-core temperature")
-        case .genericPrimarySecondary:
-            return language.text("主核心温度", "Primary-core temperature")
-        case .performanceEfficiency, .singlePerformanceTier:
-            return language.text("P 核温度", "P-core temperature")
-        }
+        let label = cpu.coreTierMode.primaryDisplayName(in: language)
+        return language.text("\(label)温度", "\(label) temperature")
     }
 
     private func secondaryCoreTemperatureLabel() -> String {
-        switch cpu.coreTierMode {
-        case .superPerformance:
-            return language.text("性能核温度", "Performance-core temperature")
-        case .performanceEfficiency:
-            return language.text("E 核温度", "E-core temperature")
-        case .superEfficiency:
-            return language.text("E 核温度", "E-core temperature")
-        case .genericPrimarySecondary:
-            return language.text("次核心温度", "Secondary-core temperature")
-        case .singlePerformanceTier:
-            return language.text("单层性能核温度", "Performance-core temperature")
-        }
+        let label = cpu.coreTierMode.secondaryDisplayName(in: language) ?? cpu.coreTierMode.primaryDisplayName(in: language)
+        return language.text("\(label)温度", "\(label) temperature")
     }
 
     private func virtualizationStatusText() -> String {
@@ -2109,6 +2074,7 @@ extension SystemMonitor {
         let energyNanojoules: UInt64
         let packageIdleWakeups: UInt64
         let interruptWakeups: UInt64
+        let processCPUType: cpu_type_t?
         let threadCount: Int
         let openFiles: Int
         let isApplication: Bool
@@ -2861,6 +2827,10 @@ extension SystemMonitor {
             }
         }
 
+        var archInfo = proc_archinfo()
+        let archResult = proc_pidinfo(pid, PROC_PIDARCHINFO, 0, &archInfo, Int32(MemoryLayout<proc_archinfo>.size))
+        let processCPUType: cpu_type_t? = archResult == Int32(MemoryLayout<proc_archinfo>.size) ? archInfo.p_cputype : nil
+
         let app = path.hasSuffix(".app") || path.contains("/Applications/") || path.contains("/System/Applications/")
         return ProcessSnapshot(
             pid: pid,
@@ -2873,6 +2843,7 @@ extension SystemMonitor {
             energyNanojoules: usageResult == 0 ? usage.ri_energy_nj : 0,
             packageIdleWakeups: usageResult == 0 ? usage.ri_pkg_idle_wkups : 0,
             interruptWakeups: usageResult == 0 ? usage.ri_interrupt_wkups : 0,
+            processCPUType: processCPUType,
             threadCount: Int(taskInfo.pti_threadnum),
             openFiles: Int(bsdInfo.pbi_nfiles),
             isApplication: app,
@@ -2912,14 +2883,25 @@ extension SystemMonitor {
         return "\(uid)"
     }
 
-    func processPlatform(flags: UInt32) -> String {
+    func processPlatform(flags: UInt32, processCPUType: cpu_type_t?) -> String {
         let is64Bit = (flags & UInt32(PROC_FLAG_LP64)) != 0
+        if let processCPUType {
+            switch processCPUType {
+            case cpu_type_t(CPU_TYPE_X86_64), cpu_type_t(CPU_TYPE_X86):
+                return cpuArchitecture == .appleSilicon ? "Rosetta 2" : "x86_64"
+            case cpu_type_t(CPU_TYPE_ARM64):
+                return "ARM64"
+            default:
+                break
+            }
+        }
+
         switch cpuArchitecture {
         case .appleSilicon:
             if is64Bit {
-                return "ARM64"
+                return "Rosetta 2"
             }
-            return "x86_64"
+            return "ARM64"
         case .intelLike, .unknown:
             return is64Bit ? "64-bit" : "32-bit"
         }
@@ -3232,9 +3214,18 @@ extension SystemMonitor {
             guard !deviceIdentifier.isEmpty else { continue }
 
             let size = (mediaProps["Size"] as? NSNumber)?.uint64Value ?? 0
-            let removable = (mediaProps["Removable"] as? Bool) ?? false || ((mediaProps["Ejectable"] as? Bool) ?? false)
             let model = ioRegistryName(media).isEmpty ? deviceIdentifier : ioRegistryName(media)
-            let kind = removable ? "Removable" : (model.localizedCaseInsensitiveContains("SSD") ? "SSD" : "HDD")
+            let kind = diskKindCache[deviceIdentifier] ?? {
+                let resolved = resolveDiskKind(
+                    deviceIdentifier: deviceIdentifier,
+                    mediaProps: mediaProps,
+                    model: model,
+                    service: service,
+                    media: media
+                )
+                diskKindCache[deviceIdentifier] = resolved
+                return resolved
+            }()
             let label = mountInfo[deviceIdentifier]?.label ?? deviceIdentifier
             let available = mountInfo[deviceIdentifier]?.availableBytes ?? size
 
@@ -3260,6 +3251,152 @@ extension SystemMonitor {
         }
 
         return result
+    }
+
+    private func resolveDiskKind(
+        deviceIdentifier: String,
+        mediaProps: [String: Any],
+        model: String,
+        service: io_registry_entry_t,
+        media: io_registry_entry_t
+    ) -> String {
+        let registryHints = registryHintStrings(for: service) + registryHintStrings(for: media)
+
+        if let info = diskutilInfo(deviceIdentifier: deviceIdentifier) {
+            let isInternal = (info["Internal"] as? Bool) ?? false
+            let removableExternal = (info["RemovableMediaOrExternalDevice"] as? Bool) ?? false
+            let removableMedia = (info["RemovableMedia"] as? Bool) ?? false
+            let ejectable = (info["Ejectable"] as? Bool) ?? false
+            let busProtocol = (info["BusProtocol"] as? String) ?? ""
+            let deviceTreePath = (info["DeviceTreePath"] as? String) ?? ""
+            let solidState = (info["SolidState"] as? Bool) ?? model.localizedCaseInsensitiveContains("SSD")
+
+            if !isInternal || removableExternal || removableMedia || ejectable {
+                return "Removable"
+            }
+
+            return normalizedInternalDiskInterface(
+                busProtocol: busProtocol,
+                deviceTreePath: deviceTreePath,
+                solidState: solidState,
+                registryHints: registryHints
+            )
+        }
+
+        let removable = (mediaProps["Removable"] as? Bool) ?? false || ((mediaProps["Ejectable"] as? Bool) ?? false)
+        if removable {
+            return "Removable"
+        }
+        return normalizedInternalDiskInterface(
+            busProtocol: "",
+            deviceTreePath: "",
+            solidState: model.localizedCaseInsensitiveContains("SSD"),
+            registryHints: registryHints
+        )
+    }
+
+    private func diskutilInfo(deviceIdentifier: String) -> [String: Any]? {
+        guard let data = try? Process.runAndCapture("/usr/sbin/diskutil", ["info", "-plist", "/dev/\(deviceIdentifier)"]) else {
+            return nil
+        }
+        return (try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)) as? [String: Any]
+    }
+
+    private func normalizedInternalDiskInterface(
+        busProtocol: String,
+        deviceTreePath: String,
+        solidState: Bool,
+        registryHints: [String]
+    ) -> String {
+        let lowerBus = busProtocol.lowercased()
+        let lowerTreePath = deviceTreePath.lowercased()
+        let lowerHints = registryHints.joined(separator: " ").lowercased()
+        let combinedHints = [lowerBus, lowerTreePath, lowerHints]
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+
+        if combinedHints.contains("ionvmefamily")
+            || combinedHints.contains("nvmexpress")
+            || combinedHints.contains("ioembeddednvmeblockdevice")
+            || combinedHints.contains("appleembeddednvmetemperaturesensor")
+            || combinedHints.contains("nvme")
+            || combinedHints.contains("appleans")
+            || combinedHints.contains("apple fabric")
+        {
+            return "NVMe"
+        }
+        if solidState && (combinedHints.contains("pci") || combinedHints.contains("pcie")) {
+            return "NVMe"
+        }
+        if combinedHints.contains("sata")
+            || combinedHints.contains("ata")
+            || combinedHints.contains("ahci")
+        {
+            return "SATA"
+        }
+        if combinedHints.contains("ide") {
+            return "IDE"
+        }
+        return busProtocol.isEmpty ? "Internal" : busProtocol
+    }
+
+    private func registryHintStrings(for entry: io_registry_entry_t, maxDepth: Int = 8) -> [String] {
+        var hints: [String] = []
+        var current = entry
+        var depth = 0
+        var releaseCurrent = false
+
+        while current != 0, depth < maxDepth {
+            hints.append(ioRegistryName(current))
+            appendRegistryHintProperties(from: current, into: &hints)
+
+            var parent: io_registry_entry_t = 0
+            guard IORegistryEntryGetParentEntry(current, kIOServicePlane, &parent) == KERN_SUCCESS, parent != 0 else {
+                break
+            }
+
+            if releaseCurrent {
+                IOObjectRelease(current)
+            }
+            current = parent
+            releaseCurrent = true
+            depth += 1
+        }
+
+        if releaseCurrent, current != 0 {
+            IOObjectRelease(current)
+        }
+
+        return hints
+    }
+
+    private func appendRegistryHintProperties(from entry: io_registry_entry_t, into hints: inout [String]) {
+        let properties = registryProperties(entry)
+        let stringKeys = [
+            "IOClass",
+            "CFBundleIdentifier",
+            "Physical Interconnect",
+            "Physical Interconnect Location",
+            "device-type",
+            "Protocol",
+            "Model Number",
+            "MediaName"
+        ]
+
+        for key in stringKeys {
+            if let value = properties[key] as? String, !value.isEmpty {
+                hints.append(value)
+            }
+        }
+
+        if let protocolCharacteristics = properties["Protocol Characteristics"] as? [String: Any] {
+            if let interconnect = protocolCharacteristics["Physical Interconnect"] as? String, !interconnect.isEmpty {
+                hints.append(interconnect)
+            }
+            if let location = protocolCharacteristics["Physical Interconnect Location"] as? String, !location.isEmpty {
+                hints.append(location)
+            }
+        }
     }
 
     func wholeMediaChild(of service: io_registry_entry_t) -> io_registry_entry_t? {

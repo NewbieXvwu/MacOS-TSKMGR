@@ -50,135 +50,141 @@ struct RootWindowView: View {
     @State private var taskActionErrorMessage = ""
     @State private var lastWindowPresentationMode: WindowPresentationMode?
     @State private var commandKeyPressed = false
+    @State private var compactTransitionInProgress = false
 
     var body: some View {
         ZStack(alignment: .topLeading) {
-            if compactMode {
-                CompactModeContainer(
-                    rows: compactApplicationRows,
-                    selectedPID: $selectedProcessPID,
-                    primaryActionTitle: primaryTaskActionTitle,
-                    onToggleCompact: toggleCompactMode,
-                    onPrimaryAction: performPrimaryTaskAction
-                )
-            } else if selectedTab == .performance && performanceViewMode == .detailSummary {
-                PerformancePageView(
-                    monitor: monitor,
-                    selectedPerf: $selectedPerf,
-                    viewMode: $performanceViewMode,
-                    showsGraphs: $showsPerformanceGraphs,
-                    cpuGraphMode: $cpuGraphMode,
-                    gpuGraphLayoutMode: $gpuGraphLayoutMode,
-                    showsKernelTime: $showsKernelTime,
-                    onOpenNetworkDetails: { networkDetailsPanelManager.show(network: $0, language: language) }
-                )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if selectedTab == .performance && performanceViewMode == .summary {
-                PerformancePageView(
-                    monitor: monitor,
-                    selectedPerf: $selectedPerf,
-                    viewMode: $performanceViewMode,
-                    showsGraphs: $showsPerformanceGraphs,
-                    cpuGraphMode: $cpuGraphMode,
-                    gpuGraphLayoutMode: $gpuGraphLayoutMode,
-                    showsKernelTime: $showsKernelTime,
-                    onOpenNetworkDetails: { networkDetailsPanelManager.show(network: $0, language: language) }
-                )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                VStack(spacing: 0) {
-                    WindowChromeView(
-                        selectedTab: $selectedTab,
-                        activeMenu: $activeMenu
-                    )
-
-                    Group {
-                        switch selectedTab {
-                        case .processes:
-                            ProcessesPageView(
-                                monitor: monitor,
-                                collapsedSections: $collapsedSections,
-                                selectedPID: $selectedProcessPID,
-                                memoryDisplayMode: $processMemoryDisplayMode,
-                                diskDisplayMode: $processDiskDisplayMode,
-                                networkDisplayMode: $processNetworkDisplayMode,
-                                onEndTask: endTask(pid:),
-                                onRestartTask: restartProcess,
-                                onRevealInFinder: revealInFinder,
-                                onSearchWeb: searchWeb,
-                                onShowProperties: showProcessProperties,
-                                onCopyProcessDetails: copyProcessDetails,
-                                onOpenDetailsTab: openDetailsTab
-                            )
-                        case .performance:
-                            PerformancePageView(
-                                monitor: monitor,
-                                selectedPerf: $selectedPerf,
-                                viewMode: $performanceViewMode,
-                                showsGraphs: $showsPerformanceGraphs,
-                                cpuGraphMode: $cpuGraphMode,
-                                gpuGraphLayoutMode: $gpuGraphLayoutMode,
-                                showsKernelTime: $showsKernelTime,
-                                onOpenNetworkDetails: { networkDetailsPanelManager.show(network: $0, language: language) }
-                            )
-                        case .history:
-                            AppHistoryPageView(monitor: monitor)
-                        case .startup:
-                            StartupPageView(monitor: monitor)
-                        case .users:
-                            UsersPageView(
-                                monitor: monitor,
-                                selectedPID: $selectedProcessPID,
-                                memoryDisplayMode: $processMemoryDisplayMode,
-                                diskDisplayMode: $processDiskDisplayMode,
-                                networkDisplayMode: $processNetworkDisplayMode,
-                                onEndTask: endTask(pid:),
-                                onRestartTask: restartProcess,
-                                onRevealInFinder: revealInFinder,
-                                onSearchWeb: searchWeb,
-                                onShowProperties: showProcessProperties,
-                                onCopyProcessDetails: copyProcessDetails,
-                                onOpenDetailsTab: openDetailsTab
-                            )
-                        case .details:
-                            DetailsPageView(
-                                monitor: monitor,
-                                selectedPID: $selectedProcessPID,
-                                memoryDisplayMode: $processMemoryDisplayMode,
-                                onEndTask: endTask(pid:),
-                                onEndProcessTree: endProcessTree(pid:),
-                                onRestartTask: restartProcess,
-                                onRevealInFinder: revealInFinder,
-                                onSearchWeb: searchWeb,
-                                onShowProperties: showProcessProperties,
-                                onCopyProcessDetails: copyProcessDetails,
-                                onOpenDetailsTab: openDetailsTab,
-                                onOpenServicesTab: openServicesTab,
-                                onSetPriority: setProcessPriority(pid:preset:)
-                            )
-                        case .services:
-                            ServicesPageView(
-                                monitor: monitor,
-                                selectedPID: $selectedProcessPID,
-                                onStartService: startService,
-                                onStopService: stopService,
-                                onRestartService: restartService,
-                                onSearchWeb: searchWeb,
-                                onOpenDetailsTab: openDetailsTab
-                            )
-                        }
-                    }
+            if compactTransitionInProgress {
+                Color.clear
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-                    FooterBarView(
-                        compactMode: $compactMode,
-                        canEndTask: canEndSelectedTask,
+            } else {
+                if compactMode {
+                    CompactModeContainer(
+                        rows: compactApplicationRows,
+                        selectedPID: $selectedProcessPID,
                         primaryActionTitle: primaryTaskActionTitle,
                         onToggleCompact: toggleCompactMode,
                         onPrimaryAction: performPrimaryTaskAction
                     )
+                } else if selectedTab == .performance && performanceViewMode == .detailSummary {
+                    PerformancePageView(
+                        monitor: monitor,
+                        selectedPerf: $selectedPerf,
+                        viewMode: $performanceViewMode,
+                        showsGraphs: $showsPerformanceGraphs,
+                        cpuGraphMode: $cpuGraphMode,
+                        gpuGraphLayoutMode: $gpuGraphLayoutMode,
+                        showsKernelTime: $showsKernelTime,
+                        onOpenNetworkDetails: { networkDetailsPanelManager.show(network: $0, language: language) }
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if selectedTab == .performance && performanceViewMode == .summary {
+                    PerformancePageView(
+                        monitor: monitor,
+                        selectedPerf: $selectedPerf,
+                        viewMode: $performanceViewMode,
+                        showsGraphs: $showsPerformanceGraphs,
+                        cpuGraphMode: $cpuGraphMode,
+                        gpuGraphLayoutMode: $gpuGraphLayoutMode,
+                        showsKernelTime: $showsKernelTime,
+                        onOpenNetworkDetails: { networkDetailsPanelManager.show(network: $0, language: language) }
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    VStack(spacing: 0) {
+                        WindowChromeView(
+                            selectedTab: $selectedTab,
+                            activeMenu: $activeMenu
+                        )
+
+                        Group {
+                            switch selectedTab {
+                            case .processes:
+                                ProcessesPageView(
+                                    monitor: monitor,
+                                    collapsedSections: $collapsedSections,
+                                    selectedPID: $selectedProcessPID,
+                                    memoryDisplayMode: $processMemoryDisplayMode,
+                                    diskDisplayMode: $processDiskDisplayMode,
+                                    networkDisplayMode: $processNetworkDisplayMode,
+                                    onEndTask: endTask(pid:),
+                                    onRestartTask: restartProcess,
+                                    onRevealInFinder: revealInFinder,
+                                    onSearchWeb: searchWeb,
+                                    onShowProperties: showProcessProperties,
+                                    onCopyProcessDetails: copyProcessDetails,
+                                    onOpenDetailsTab: openDetailsTab
+                                )
+                            case .performance:
+                                PerformancePageView(
+                                    monitor: monitor,
+                                    selectedPerf: $selectedPerf,
+                                    viewMode: $performanceViewMode,
+                                    showsGraphs: $showsPerformanceGraphs,
+                                    cpuGraphMode: $cpuGraphMode,
+                                    gpuGraphLayoutMode: $gpuGraphLayoutMode,
+                                    showsKernelTime: $showsKernelTime,
+                                    onOpenNetworkDetails: { networkDetailsPanelManager.show(network: $0, language: language) }
+                                )
+                            case .history:
+                                AppHistoryPageView(monitor: monitor)
+                            case .startup:
+                                StartupPageView(monitor: monitor)
+                            case .users:
+                                UsersPageView(
+                                    monitor: monitor,
+                                    selectedPID: $selectedProcessPID,
+                                    memoryDisplayMode: $processMemoryDisplayMode,
+                                    diskDisplayMode: $processDiskDisplayMode,
+                                    networkDisplayMode: $processNetworkDisplayMode,
+                                    onEndTask: endTask(pid:),
+                                    onRestartTask: restartProcess,
+                                    onRevealInFinder: revealInFinder,
+                                    onSearchWeb: searchWeb,
+                                    onShowProperties: showProcessProperties,
+                                    onCopyProcessDetails: copyProcessDetails,
+                                    onOpenDetailsTab: openDetailsTab
+                                )
+                            case .details:
+                                DetailsPageView(
+                                    monitor: monitor,
+                                    selectedPID: $selectedProcessPID,
+                                    memoryDisplayMode: $processMemoryDisplayMode,
+                                    onEndTask: endTask(pid:),
+                                    onEndProcessTree: endProcessTree(pid:),
+                                    onRestartTask: restartProcess,
+                                    onRevealInFinder: revealInFinder,
+                                    onSearchWeb: searchWeb,
+                                    onShowProperties: showProcessProperties,
+                                    onCopyProcessDetails: copyProcessDetails,
+                                    onOpenDetailsTab: openDetailsTab,
+                                    onOpenServicesTab: openServicesTab,
+                                    onSetPriority: setProcessPriority(pid:preset:)
+                                )
+                            case .services:
+                                ServicesPageView(
+                                    monitor: monitor,
+                                    selectedPID: $selectedProcessPID,
+                                    onStartService: startService,
+                                    onStopService: stopService,
+                                    onRestartService: restartService,
+                                    onSearchWeb: searchWeb,
+                                    onOpenDetailsTab: openDetailsTab
+                                )
+                            }
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                        FooterBarView(
+                            compactMode: $compactMode,
+                            canEndTask: canEndSelectedTask,
+                            primaryActionTitle: primaryTaskActionTitle,
+                            onToggleCompact: toggleCompactMode,
+                            onPrimaryAction: performPrimaryTaskAction
+                        )
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
 
             if let activeMenu {
@@ -245,7 +251,9 @@ struct RootWindowView: View {
         }
         .onChange(of: compactMode) { _, _ in
             exitPerformanceSummaryIfNeeded()
-            resizeWindowIfNeeded(animated: true)
+            DispatchQueue.main.async {
+                resizeWindowIfNeeded(animated: true)
+            }
         }
         .onChange(of: performanceViewMode) { _, _ in
             resizeWindowIfNeeded(animated: true)
@@ -647,6 +655,7 @@ struct RootWindowView: View {
     }
 
     private func toggleCompactMode() {
+        compactTransitionInProgress = true
         compactMode.toggle()
     }
 
@@ -674,7 +683,10 @@ struct RootWindowView: View {
     }
 
     private func resizeWindowForCurrentMode(animated: Bool) {
-        guard let window = NSApp.keyWindow ?? NSApp.windows.first else { return }
+        guard let window = NSApp.keyWindow ?? NSApp.windows.first else {
+            compactTransitionInProgress = false
+            return
+        }
         let targetSize: NSSize
         let minSize: NSSize
 
@@ -698,9 +710,18 @@ struct RootWindowView: View {
         var frame = window.frame
         frame.size = targetSize
         if animated {
-            window.animator().setFrame(frame, display: true)
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.18
+                context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                window.animator().setFrame(frame, display: true)
+            } completionHandler: {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) {
+                    compactTransitionInProgress = false
+                }
+            }
         } else {
             window.setFrame(frame, display: true)
+            compactTransitionInProgress = false
         }
     }
 
@@ -1188,31 +1209,31 @@ struct CompactApplicationsView: View {
     @Binding var selectedPID: Int32?
 
     var body: some View {
-        List {
-            ForEach(rows) { row in
-                HStack(spacing: 10) {
-                    ProcessIconView(icon: row.icon)
-                    Text(row.name)
-                        .font(.system(size: 14))
-                        .lineLimit(1)
+        ScrollView {
+            LazyVStack(spacing: 0) {
+                ForEach(rows) { row in
+                    HStack(spacing: 10) {
+                        ProcessIconView(icon: row.icon)
+                        Text(row.name)
+                            .font(.system(size: 14))
+                            .lineLimit(1)
+                        Spacer(minLength: 0)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .frame(height: 34)
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 4)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(selectedPID == row.pid ? AppTheme.selectedRow(colorScheme) : Color.clear)
+                    )
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        selectedPID = row.pid
+                    }
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .frame(height: 34)
-                .padding(.horizontal, 8)
-                .background(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(selectedPID == row.pid ? AppTheme.selectedRow(colorScheme) : Color.clear)
-                )
-                .contentShape(Rectangle())
-                .onTapGesture {
-                    selectedPID = row.pid
-                }
-                .listRowInsets(EdgeInsets(top: 4, leading: 10, bottom: 4, trailing: 10))
-                .listRowBackground(Color.clear)
             }
         }
-        .listStyle(.plain)
-        .scrollContentBackground(.hidden)
         .background(Color.clear)
         .onAppear {
             if selectedPID == nil {

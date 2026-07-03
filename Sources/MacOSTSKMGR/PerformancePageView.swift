@@ -668,7 +668,7 @@ struct PerformancePageView: View {
                 title: language.text("实时温度", "Real-time temperature"),
                 rows: [
                     (language.text("CPU 温度", "CPU temperature"), thermalValue(monitor.thermal.cpuTemperatureCelsius)),
-                    (language.text("P核/E核温度", "P/E-core temperature"), combinedThermalValue(
+                    (combinedCoreTemperatureLabel(), combinedCoreThermalValue(
                         primary: monitor.thermal.performanceCoreTemperatureCelsius,
                         secondary: monitor.thermal.efficiencyCoreTemperatureCelsius
                     )),
@@ -695,7 +695,16 @@ struct PerformancePageView: View {
         temperatureUnit.format(value)
     }
 
-    private func combinedThermalValue(primary: Double?, secondary: Double?) -> String {
+    private func combinedCoreTemperatureLabel() -> String {
+        let label = monitor.cpu.coreTierMode.combinedDisplayName(in: language)
+        return language.text("\(label)温度", "\(label) temperature")
+    }
+
+    private func combinedCoreThermalValue(primary: Double?, secondary: Double?) -> String {
+        guard monitor.cpu.coreTierMode.secondaryDisplayName(in: language) != nil else {
+            return temperatureUnit.format(primary)
+        }
+
         switch (primary, secondary) {
         case let (p?, s?):
             return "\(temperatureUnit.format(p))/\(temperatureUnit.format(s))"
