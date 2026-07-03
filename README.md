@@ -4,6 +4,16 @@
 
 Latest Release：https://github.com/JOHN-decm/MacOS-TSKMGR/releases/tag/TSKMGR260703v1
 
+## 免责声明 / Disclaimer
+
+本项目是一个开源仿制项目，界面灵感来源于 Windows 任务管理器，仅供在 macOS 上用于学习和个人使用。它与微软公司没有任何关联，也未获得微软公司的认可、授权或背书。
+Windows是微软公司的注册商标。
+
+This project is an open-source clone inspired by the Windows Task Manager UI, created for educational and personal use on macOS. It is not affiliated with, endorsed by, or associated with Microsoft Corporation in any way.
+Windows is a registered trademark of Microsoft Corporation.
+
+## 介绍 / Intro
+
 一个面向 macOS 26 的原生任务管理器项目，界面和交互风格参考 Windows 10 任务管理器，同时尽量保留 macOS 上更底层的实时监控能力。基于 SwiftUI 与 AppKit 的桌面应用，支持 Intel 与 Apple Silicon，并分别提供对应架构的独立 `.app` 打包产物。
 
 A native task manager for macOS 26, visually and behaviorally inspired by Windows 10 Task Manager while keeping access to lower-level real-time macOS metrics. It is a SwiftUI + AppKit desktop application with separate standalone `.app` packages for Intel and Apple Silicon.
