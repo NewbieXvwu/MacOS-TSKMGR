@@ -9,6 +9,11 @@ enum AppLanguage: String, CaseIterable, Identifiable {
 
     var isChinese: Bool { self == .chinese }
 
+    static func defaultFromSystem() -> AppLanguage {
+        let preferredLanguage = Locale.preferredLanguages.first?.lowercased() ?? ""
+        return preferredLanguage.hasPrefix("zh-hans") ? .chinese : .english
+    }
+
     func text(_ chinese: String, _ english: String) -> String {
         isChinese ? chinese : english
     }
@@ -36,17 +41,6 @@ enum AppLanguage: String, CaseIterable, Identifiable {
             }
         }
         return translateImpact(value)
-    }
-
-    func translateProcessSectionTitle(_ title: String) -> String {
-        guard !isChinese else { return title }
-        if title.hasPrefix("应用 (") {
-            return title.replacingOccurrences(of: "应用", with: "Apps")
-        }
-        if title.hasPrefix("后台进程 (") {
-            return title.replacingOccurrences(of: "后台进程", with: "Background")
-        }
-        return title
     }
 
     func translateStartupStatus(_ value: String) -> String {
@@ -188,6 +182,7 @@ enum AppLanguage: String, CaseIterable, Identifiable {
         case "可移动": return "Removable"
         case "内建": return "Internal"
         case "外建": return "External"
+        case "未知": return "Unknown"
         default: return value
         }
     }
@@ -198,6 +193,7 @@ enum AppLanguage: String, CaseIterable, Identifiable {
             case "Removable": return "可移动"
             case "Internal": return "内建"
             case "External": return "外建"
+            case "Unknown": return "未知"
             default: return value
             }
         }
@@ -302,6 +298,26 @@ private struct TemperatureUnitKey: EnvironmentKey {
     static let defaultValue: TemperatureUnit = .celsius
 }
 
+enum MenuVisualStyle: String, CaseIterable, Identifiable {
+    case windowsNT
+    case macOS26
+
+    var id: String { rawValue }
+
+    func title(in language: AppLanguage) -> String {
+        switch self {
+        case .windowsNT:
+            return language.text("Windows NT 风格", "Windows NT Style")
+        case .macOS26:
+            return language.text("macOS 26 风格", "macOS 26 Style")
+        }
+    }
+}
+
+private struct MenuVisualStyleKey: EnvironmentKey {
+    static let defaultValue: MenuVisualStyle = .windowsNT
+}
+
 extension EnvironmentValues {
     var appLanguage: AppLanguage {
         get { self[AppLanguageKey.self] }
@@ -312,6 +328,65 @@ extension EnvironmentValues {
         get { self[TemperatureUnitKey.self] }
         set { self[TemperatureUnitKey.self] = newValue }
     }
+
+    var menuVisualStyle: MenuVisualStyle {
+        get { self[MenuVisualStyleKey.self] }
+        set { self[MenuVisualStyleKey.self] = newValue }
+    }
+}
+
+@MainActor
+final class FinderBarCommandState: ObservableObject {
+    static let shared = FinderBarCommandState()
+
+    @Published var language: AppLanguage = .defaultFromSystem()
+    @Published var temperatureUnit: TemperatureUnit = .celsius
+    @Published var menuVisualStyle: MenuVisualStyle = .windowsNT
+    @Published var alwaysOnTop = false
+    @Published var useSmallValues = false
+    @Published var hideWhenMinimized = false
+    @Published var refreshSpeed: RefreshSpeedOption = .normal
+    @Published var compactMode = true
+
+    func sync(
+        language: AppLanguage? = nil,
+        temperatureUnit: TemperatureUnit? = nil,
+        menuVisualStyle: MenuVisualStyle? = nil,
+        alwaysOnTop: Bool? = nil,
+        useSmallValues: Bool? = nil,
+        hideWhenMinimized: Bool? = nil,
+        refreshSpeed: RefreshSpeedOption? = nil,
+        compactMode: Bool? = nil
+    ) {
+        if let language { self.language = language }
+        if let temperatureUnit { self.temperatureUnit = temperatureUnit }
+        if let menuVisualStyle { self.menuVisualStyle = menuVisualStyle }
+        if let alwaysOnTop { self.alwaysOnTop = alwaysOnTop }
+        if let useSmallValues { self.useSmallValues = useSmallValues }
+        if let hideWhenMinimized { self.hideWhenMinimized = hideWhenMinimized }
+        if let refreshSpeed { self.refreshSpeed = refreshSpeed }
+        if let compactMode { self.compactMode = compactMode }
+    }
+}
+
+enum FinderBarCommand: String {
+    case runNewTask
+    case showAbout
+    case quitApp
+    case toggleAlwaysOnTop
+    case toggleUseSmallValues
+    case toggleHideWhenMinimized
+    case refreshNow
+    case expandAll
+    case collapseAll
+    case setLanguage
+    case setTemperatureUnit
+    case setMenuVisualStyle
+    case setRefreshSpeed
+}
+
+extension Notification.Name {
+    static let finderBarCommandTriggered = Notification.Name("FinderBarCommandTriggered")
 }
 
 enum TaskTab: String, CaseIterable, Identifiable {
@@ -521,10 +596,31 @@ struct ProcessRowData: Identifiable {
     var id: Int32 { pid }
 }
 
+enum ProcessSectionKind: String, CaseIterable, Identifiable, Hashable {
+    case apps
+    case background
+
+    var id: String { rawValue }
+
+    func title(in language: AppLanguage, count: Int) -> String {
+        switch self {
+        case .apps:
+            return language.text("应用", "Apps") + " (\(count))"
+        case .background:
+            return language.text("后台进程", "Background") + " (\(count))"
+        }
+    }
+}
+
 struct ProcessSectionData: Identifiable {
-    let title: String
+    let kind: ProcessSectionKind
     let rows: [ProcessRowData]
-    let id = UUID()
+
+    var id: String { kind.id }
+
+    func title(in language: AppLanguage) -> String {
+        kind.title(in: language, count: rows.count)
+    }
 }
 
 struct UserPageSectionData: Identifiable {
@@ -661,6 +757,7 @@ struct DiskState: Identifiable {
     var capacityBytes: UInt64
     var availableBytes: UInt64
     var isSystemDisk: Bool
+    var hasDetailedMetadata: Bool
     var activityPercent: Double
     var responseTimeMs: Double
     var readBytesPerSecond: UInt64
@@ -715,6 +812,9 @@ struct GPUState: Identifiable {
     var tilerUtilizationPercent: Double
     var sharedMemoryUsedBytes: UInt64
     var sharedMemoryAllocatedBytes: UInt64
+    var dedicatedMemoryUsedBytes: UInt64
+    var dedicatedMemoryTotalBytes: UInt64
+    var supportsEngineBreakdown: Bool
     var metalVersion: String
     var openGLVersion: String?
     var historyOverall: [Double]

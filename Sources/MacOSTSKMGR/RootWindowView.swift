@@ -14,12 +14,45 @@ private enum WindowPresentationMode: Equatable {
     case full
 }
 
+enum KeyboardNavigationCommand {
+    case focusNext
+    case focusPrevious
+    case moveUp
+    case moveDown
+    case moveLeft
+    case moveRight
+    case activatePrimary
+    case activateSecondary
+    case back
+    case cancel
+}
+
+private enum KeyboardFocusArea: Equatable {
+    case topTabs
+    case compactList
+    case compactMoreDetailsButton
+    case compactPrimaryActionButton
+    case performanceSidebar
+    case performanceDetail
+    case processTable
+    case footerToggleCompact
+    case footerPrimaryAction
+}
+
+private enum ProcessKeyboardItem: Equatable {
+    case section(ProcessSectionKind)
+    case row(ProcessSectionKind, Int32)
+}
+
 struct RootWindowView: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @AppStorage("menu_visual_style") private var menuVisualStyleRawValue: String = MenuVisualStyle.windowsNT.rawValue
     @StateObject private var monitor = SystemMonitor()
     @StateObject private var newTaskPanelManager = NewTaskPanelManager()
     @StateObject private var networkDetailsPanelManager = NetworkDetailsPanelManager()
-    @StateObject private var aboutPanelManager = AboutPanelManager()
-    @State private var language: AppLanguage = Self.defaultLanguageFromSystem()
+    @StateObject private var aboutPanelManager = AboutPanelManager.shared
+    private let finderBarCommandState = FinderBarCommandState.shared
+    @State private var language: AppLanguage = AppLanguage.defaultFromSystem()
     @State private var temperatureUnit: TemperatureUnit = .celsius
     @State private var selectedTab: TaskTab = .processes
     @State private var selectedPerf: PerfSelection = .cpu
@@ -30,19 +63,10 @@ struct RootWindowView: View {
     @State private var showsKernelTime = false
     @State private var compactMode = true
     @State private var activeMenu: MenuKind?
-    @State private var showRefreshSpeedSubmenu = false
-    @State private var showLanguageSubmenu = false
-    @State private var showTemperatureUnitSubmenu = false
-    @State private var refreshSpeedParentHovered = false
-    @State private var refreshSpeedSubmenuHovered = false
-    @State private var languageParentHovered = false
-    @State private var languageSubmenuHovered = false
-    @State private var temperatureUnitParentHovered = false
-    @State private var temperatureUnitSubmenuHovered = false
     @State private var alwaysOnTop = false
     @State private var hideWhenMinimized = false
     @State private var useSmallValues = false
-    @State private var collapsedSections: Set<String> = []
+    @State private var collapsedSections: Set<ProcessSectionKind> = []
     @State private var processMemoryDisplayMode: ProcessResourceDisplayMode = .value
     @State private var processDiskDisplayMode: ProcessResourceDisplayMode = .value
     @State private var processNetworkDisplayMode: ProcessResourceDisplayMode = .value
@@ -51,8 +75,178 @@ struct RootWindowView: View {
     @State private var lastWindowPresentationMode: WindowPresentationMode?
     @State private var commandKeyPressed = false
     @State private var compactTransitionInProgress = false
+    @State private var activeOptionsSubmenu: OptionsSubmenuKind?
+    @State private var hoveredOptionsSubmenuParent: OptionsSubmenuKind?
+    @State private var optionsSubmenuHovered = false
+    @State private var activeViewSubmenu: ViewSubmenuKind?
+    @State private var hoveredViewSubmenuParent: ViewSubmenuKind?
+    @State private var viewSubmenuHovered = false
+    @State private var pendingPerformanceSelection: PerfSelection?
+    @State private var menuKeyboardContext: MenuKeyboardContext?
+    @State private var menuKeyboardIndex = 0
+    @State private var keyboardFocusArea: KeyboardFocusArea = .compactList
+    @State private var selectedProcessSectionKind: ProcessSectionKind?
+    @State private var processSortKey: ProcessSortKey = .cpu
+    @State private var processSortAscending = false
+
+    private var menuVisualStyle: MenuVisualStyle {
+        get { MenuVisualStyle(rawValue: menuVisualStyleRawValue) ?? .windowsNT }
+        nonmutating set { menuVisualStyleRawValue = newValue.rawValue }
+    }
 
     var body: some View {
+        lifecycleObservedContent
+            .environment(\.appLanguage, language)
+            .environment(\.temperatureUnit, temperatureUnit)
+            .environment(\.menuVisualStyle, menuVisualStyle)
+    }
+
+    private var lifecycleObservedContent: some View {
+        AnyView(interactionObservedContent)
+            .onAppear {
+                applySystemPresentationPreferences()
+                let mode = currentWindowPresentationMode
+                lastWindowPresentationMode = mode
+                resizeWindowForCurrentMode(animated: false)
+            }
+            .onAppear {
+                monitor.language = language
+                monitor.temperatureUnit = temperatureUnit
+                updateDiskRefreshPolicy()
+                monitor.start()
+                normalizeKeyboardFocusArea()
+                updateWindowTrafficLights()
+                syncFinderBarCommandState()
+                updateFinderBarForCompactMode()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: NSLocale.currentLocaleDidChangeNotification)) { _ in
+                applySystemPresentationPreferences()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
+                monitor.stop()
+            }
+    }
+
+    private var interactionObservedContent: some View {
+        let base = AnyView(visualRootContent)
+        let windowObserved = AnyView(
+            base
+            .onChange(of: alwaysOnTop) { _, value in
+                updateWindowLevel(alwaysOnTop: value)
+            }
+        )
+        let menuObserved = AnyView(
+            windowObserved
+            .onChange(of: activeMenu) { _, newValue in
+                resetMenuHoverState()
+                if let newValue {
+                    menuKeyboardContext = .main(newValue)
+                    menuKeyboardIndex = 0
+                } else {
+                    menuKeyboardContext = nil
+                }
+            }
+            .onChange(of: menuVisualStyleRawValue) { _, _ in
+                activeMenu = nil
+                resetMenuHoverState()
+            }
+        )
+        let selectionObserved = AnyView(
+            menuObserved
+            .onChange(of: monitor.sidebarItems.map(\.id)) { oldIDs, newIDs in
+                guard !newIDs.isEmpty else { return }
+                guard !newIDs.contains(selectedPerf) else { return }
+
+                if let previousIndex = oldIDs.firstIndex(of: selectedPerf) {
+                    let fallbackIndex = min(previousIndex, newIDs.count - 1)
+                    selectedPerf = newIDs[fallbackIndex]
+                } else {
+                    selectedPerf = newIDs[0]
+                }
+            }
+        )
+        let hoverObserved = AnyView(selectionObserved)
+        return AnyView(
+            hoverObserved
+            .onReceive(NotificationCenter.default.publisher(for: .finderBarCommandTriggered)) { notification in
+                handleFinderBarCommand(notification)
+            }
+            .onChange(of: selectedProcessPID) { _, _ in
+                if selectedTab == .processes, selectedProcessPID != nil {
+                    selectedProcessSectionKind = nil
+                }
+            }
+            .onChange(of: compactMode) { _, _ in
+                exitPerformanceSummaryIfNeeded()
+                updateDiskRefreshPolicy()
+                normalizeKeyboardFocusArea()
+                syncFinderBarCommandState()
+                updateFinderBarForCompactMode()
+                DispatchQueue.main.async {
+                    resizeWindowIfNeeded(animated: true)
+                }
+            }
+            .onChange(of: performanceViewMode) { _, _ in
+                normalizeKeyboardFocusArea()
+                resizeWindowIfNeeded(animated: true)
+                updateWindowTrafficLights()
+            }
+            .onChange(of: selectedTab) { _, _ in
+                exitPerformanceSummaryIfNeeded()
+                updateDiskRefreshPolicy()
+                loadSelectedDiskDetailsIfNeeded()
+                normalizeKeyboardFocusArea()
+                reconcileSelectionForCurrentTab()
+                updateWindowTrafficLights()
+                resizeWindowIfNeeded(animated: true)
+            }
+            .onChange(of: selectedPerf) { _, _ in
+                loadSelectedDiskDetailsIfNeeded()
+            }
+            .onChange(of: language) { _, newValue in
+                monitor.language = newValue
+                newTaskPanelManager.update(language: newValue)
+                networkDetailsPanelManager.updateLanguage(newValue)
+                aboutPanelManager.update(language: newValue)
+                syncFinderBarCommandState()
+            }
+            .onChange(of: temperatureUnit) { _, newValue in
+                monitor.temperatureUnit = newValue
+                syncFinderBarCommandState()
+            }
+            .onChange(of: menuVisualStyleRawValue) { _, _ in
+                syncFinderBarCommandState()
+            }
+            .onChange(of: alwaysOnTop) { _, _ in
+                syncFinderBarCommandState()
+            }
+            .onChange(of: useSmallValues) { _, _ in
+                syncFinderBarCommandState()
+            }
+            .onChange(of: hideWhenMinimized) { _, _ in
+                syncFinderBarCommandState()
+            }
+            .onChange(of: monitor.refreshSpeed) { _, _ in
+                syncFinderBarCommandState()
+            }
+        )
+    }
+
+    private var visualRootContent: some View {
+        rootContent
+            .background(WindowSurfaceBackground())
+            .ignoresSafeArea(.container, edges: selectedTab == .performance && performanceViewMode != .full ? .all : .top)
+            .alert(language.text("结束任务失败", "End task failed"), isPresented: taskActionErrorPresented) {
+                Button(language.text("确定", "OK"), role: .cancel) {
+                    taskActionErrorMessage = ""
+                }
+            } message: {
+                Text(language.localizeRuntimeMessage(taskActionErrorMessage))
+            }
+            .background(keyHandlingLayer)
+    }
+
+    private var rootContent: some View {
         ZStack(alignment: .topLeading) {
             if compactTransitionInProgress {
                 Color.clear
@@ -63,13 +257,16 @@ struct RootWindowView: View {
                         rows: compactApplicationRows,
                         selectedPID: $selectedProcessPID,
                         primaryActionTitle: primaryTaskActionTitle,
+                        isMoreDetailsFocused: keyboardFocusArea == .compactMoreDetailsButton,
+                        isPrimaryActionFocused: keyboardFocusArea == .compactPrimaryActionButton,
                         onToggleCompact: toggleCompactMode,
                         onPrimaryAction: performPrimaryTaskAction
                     )
                 } else if selectedTab == .performance && performanceViewMode == .detailSummary {
                     PerformancePageView(
                         monitor: monitor,
-                        selectedPerf: $selectedPerf,
+                        selectedPerf: performanceSelectionBinding,
+                        highlightedPerf: highlightedPerformanceSelection,
                         viewMode: $performanceViewMode,
                         showsGraphs: $showsPerformanceGraphs,
                         cpuGraphMode: $cpuGraphMode,
@@ -81,7 +278,8 @@ struct RootWindowView: View {
                 } else if selectedTab == .performance && performanceViewMode == .summary {
                     PerformancePageView(
                         monitor: monitor,
-                        selectedPerf: $selectedPerf,
+                        selectedPerf: performanceSelectionBinding,
+                        highlightedPerf: highlightedPerformanceSelection,
                         viewMode: $performanceViewMode,
                         showsGraphs: $showsPerformanceGraphs,
                         cpuGraphMode: $cpuGraphMode,
@@ -92,10 +290,14 @@ struct RootWindowView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     VStack(spacing: 0) {
-                        WindowChromeView(
-                            selectedTab: $selectedTab,
-                            activeMenu: $activeMenu
-                        )
+                        if menuVisualStyle == .windowsNT {
+                            WindowChromeView(
+                                selectedTab: $selectedTab,
+                                activeMenu: $activeMenu
+                            )
+                        } else {
+                            nativeWindowChrome
+                        }
 
                         Group {
                             switch selectedTab {
@@ -104,6 +306,7 @@ struct RootWindowView: View {
                                     monitor: monitor,
                                     collapsedSections: $collapsedSections,
                                     selectedPID: $selectedProcessPID,
+                                    selectedSectionKind: selectedProcessSectionKind,
                                     memoryDisplayMode: $processMemoryDisplayMode,
                                     diskDisplayMode: $processDiskDisplayMode,
                                     networkDisplayMode: $processNetworkDisplayMode,
@@ -113,12 +316,15 @@ struct RootWindowView: View {
                                     onSearchWeb: searchWeb,
                                     onShowProperties: showProcessProperties,
                                     onCopyProcessDetails: copyProcessDetails,
-                                    onOpenDetailsTab: openDetailsTab
+                                    onOpenDetailsTab: openDetailsTab,
+                                    sortKey: $processSortKey,
+                                    ascending: $processSortAscending
                                 )
                             case .performance:
                                 PerformancePageView(
                                     monitor: monitor,
-                                    selectedPerf: $selectedPerf,
+                                    selectedPerf: performanceSelectionBinding,
+                                    highlightedPerf: highlightedPerformanceSelection,
                                     viewMode: $performanceViewMode,
                                     showsGraphs: $showsPerformanceGraphs,
                                     cpuGraphMode: $cpuGraphMode,
@@ -179,6 +385,8 @@ struct RootWindowView: View {
                             compactMode: $compactMode,
                             canEndTask: canEndSelectedTask,
                             primaryActionTitle: primaryTaskActionTitle,
+                            isToggleFocused: keyboardFocusArea == .footerToggleCompact,
+                            isPrimaryActionFocused: keyboardFocusArea == .footerPrimaryAction,
                             onToggleCompact: toggleCompactMode,
                             onPrimaryAction: performPrimaryTaskAction
                         )
@@ -187,120 +395,41 @@ struct RootWindowView: View {
                 }
             }
 
-            if let activeMenu {
+            if menuVisualStyle == .windowsNT, let activeMenu {
                 menuOverlay(for: activeMenu)
                     .padding(.top, 56)
                     .padding(.leading, menuXOffset(for: activeMenu))
                     .zIndex(10)
             }
         }
-        .background(WindowSurfaceBackground())
-        .ignoresSafeArea(.container, edges: selectedTab == .performance && performanceViewMode != .full ? .all : .top)
-        .alert(language.text("结束任务失败", "End task failed"), isPresented: taskActionErrorPresented) {
-            Button(language.text("确定", "OK"), role: .cancel) {
-                taskActionErrorMessage = ""
-            }
-        } message: {
-            Text(language.localizeRuntimeMessage(taskActionErrorMessage))
-        }
-        .background(MenuKeyHandlingView(
+    }
+
+    private var keyHandlingLayer: some View {
+        MenuKeyHandlingView(
             onAltF: { openMenu(.file) },
             onAltO: { openMenu(.options) },
             onAltV: { openMenu(.view) },
-            onEscape: { activeMenu = nil },
+            onNavigationCommand: handleKeyboardNavigation,
             onControlChanged: { monitor.setTemporarilyPaused($0) },
             onCommandChanged: { commandKeyPressed = $0 }
-        ))
-        .onChange(of: alwaysOnTop) { _, value in
-            updateWindowLevel(alwaysOnTop: value)
-        }
-        .onChange(of: monitor.sidebarItems.map(\.id)) { oldIDs, newIDs in
-            guard !newIDs.isEmpty else { return }
-            guard !newIDs.contains(selectedPerf) else { return }
-
-            if let previousIndex = oldIDs.firstIndex(of: selectedPerf) {
-                let fallbackIndex = min(previousIndex, newIDs.count - 1)
-                selectedPerf = newIDs[fallbackIndex]
-            } else {
-                selectedPerf = newIDs[0]
-            }
-        }
-        .onChange(of: refreshSpeedParentHovered) { _, _ in
-            reconcileRefreshSubmenuVisibility()
-        }
-        .onChange(of: refreshSpeedSubmenuHovered) { _, _ in
-            reconcileRefreshSubmenuVisibility()
-        }
-        .onChange(of: languageParentHovered) { _, _ in
-            reconcileLanguageSubmenuVisibility()
-        }
-        .onChange(of: languageSubmenuHovered) { _, _ in
-            reconcileLanguageSubmenuVisibility()
-        }
-        .onChange(of: temperatureUnitParentHovered) { _, _ in
-            reconcileTemperatureUnitSubmenuVisibility()
-        }
-        .onChange(of: temperatureUnitSubmenuHovered) { _, _ in
-            reconcileTemperatureUnitSubmenuVisibility()
-        }
-        .onAppear {
-            applySystemPresentationPreferences()
-            let mode = currentWindowPresentationMode
-            lastWindowPresentationMode = mode
-            resizeWindowForCurrentMode(animated: false)
-        }
-        .onChange(of: compactMode) { _, _ in
-            exitPerformanceSummaryIfNeeded()
-            DispatchQueue.main.async {
-                resizeWindowIfNeeded(animated: true)
-            }
-        }
-        .onChange(of: performanceViewMode) { _, _ in
-            resizeWindowIfNeeded(animated: true)
-            updateWindowTrafficLights()
-        }
-        .onChange(of: selectedTab) { _, _ in
-            exitPerformanceSummaryIfNeeded()
-            reconcileSelectionForCurrentTab()
-            updateWindowTrafficLights()
-            resizeWindowIfNeeded(animated: true)
-        }
-        .onChange(of: language) { _, newValue in
-            monitor.language = newValue
-            newTaskPanelManager.update(language: newValue)
-            networkDetailsPanelManager.updateLanguage(newValue)
-            aboutPanelManager.update(language: newValue)
-        }
-        .onChange(of: temperatureUnit) { _, newValue in
-            monitor.temperatureUnit = newValue
-        }
-        .onAppear {
-            monitor.language = language
-            monitor.temperatureUnit = temperatureUnit
-            monitor.start()
-            updateWindowTrafficLights()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: NSLocale.currentLocaleDidChangeNotification)) { _ in
-            applySystemPresentationPreferences()
-        }
-        .environment(\.appLanguage, language)
-        .environment(\.temperatureUnit, temperatureUnit)
-    }
-
-    private static func defaultLanguageFromSystem() -> AppLanguage {
-        let preferredLanguage = Locale.preferredLanguages.first?.lowercased() ?? ""
-        return preferredLanguage.hasPrefix("zh-hans") ? .chinese : .english
+        )
     }
 
     private func applySystemPresentationPreferences() {
-        let systemLanguage = Self.defaultLanguageFromSystem()
+        let systemLanguage = AppLanguage.defaultFromSystem()
         if language != systemLanguage {
             language = systemLanguage
         }
     }
 
     private var compactApplicationRows: [ProcessRowData] {
-        monitor.processSections.first(where: { $0.title.hasPrefix("应用") || $0.title.hasPrefix("Apps") })?.rows ?? []
+        monitor.processSections.first(where: { $0.kind == .apps })?.rows ?? []
+    }
+
+    private func setMenuVisualStyle(_ style: MenuVisualStyle) {
+        menuVisualStyle = style
+        activeMenu = nil
+        resetMenuHoverState()
     }
 
     private var canEndSelectedTask: Bool {
@@ -332,44 +461,914 @@ struct RootWindowView: View {
     }
 
     private func openMenu(_ menu: MenuKind) {
+        guard menuVisualStyle == .windowsNT else { return }
         activeMenu = menu
-        showRefreshSpeedSubmenu = false
-        showLanguageSubmenu = false
-        showTemperatureUnitSubmenu = false
-        refreshSpeedParentHovered = false
-        refreshSpeedSubmenuHovered = false
-        languageParentHovered = false
-        languageSubmenuHovered = false
-        temperatureUnitParentHovered = false
-        temperatureUnitSubmenuHovered = false
+        resetMenuHoverState()
+        menuKeyboardContext = .main(menu)
+        menuKeyboardIndex = 0
     }
 
-    private func reconcileRefreshSubmenuVisibility() {
-        showRefreshSpeedSubmenu = refreshSpeedParentHovered || refreshSpeedSubmenuHovered
+    private var availableKeyboardFocusAreas: [KeyboardFocusArea] {
+        if compactMode {
+            return [.compactList, .compactMoreDetailsButton, .compactPrimaryActionButton]
+        }
+
+        if selectedTab == .performance {
+            switch performanceViewMode {
+            case .summary:
+                return [.performanceSidebar]
+            case .detailSummary:
+                return [.performanceSidebar, .performanceDetail]
+            case .full:
+                return [.topTabs, .performanceSidebar, .performanceDetail, .footerToggleCompact, .footerPrimaryAction]
+            }
+        }
+
+        if selectedTab == .processes {
+            return [.topTabs, .processTable, .footerToggleCompact, .footerPrimaryAction]
+        }
+
+        return [.topTabs, .footerToggleCompact, .footerPrimaryAction]
     }
 
-    private func reconcileLanguageSubmenuVisibility() {
-        showLanguageSubmenu = languageParentHovered || languageSubmenuHovered
+    private var defaultKeyboardFocusArea: KeyboardFocusArea {
+        if compactMode {
+            return .compactList
+        }
+        if selectedTab == .performance {
+            return .performanceSidebar
+        }
+        if selectedTab == .processes {
+            return .processTable
+        }
+        return .topTabs
     }
 
-    private func reconcileTemperatureUnitSubmenuVisibility() {
-        showTemperatureUnitSubmenu = temperatureUnitParentHovered || temperatureUnitSubmenuHovered
+    private func normalizeKeyboardFocusArea() {
+        let areas = availableKeyboardFocusAreas
+        guard !areas.contains(keyboardFocusArea) else { return }
+        keyboardFocusArea = defaultKeyboardFocusArea
+    }
+
+    private func handleKeyboardNavigation(_ command: KeyboardNavigationCommand) {
+        if activeMenu != nil {
+            handleMenuKeyboardNavigation(command)
+            return
+        }
+
+        switch command {
+        case .focusNext:
+            focusNextArea()
+        case .focusPrevious:
+            focusPreviousArea()
+        default:
+            handleNavigationCommandInCurrentFocus(command)
+        }
+    }
+
+    private func focusNextArea() {
+        let areas = availableKeyboardFocusAreas
+        guard !areas.isEmpty else { return }
+        guard let currentIndex = areas.firstIndex(of: keyboardFocusArea) else {
+            keyboardFocusArea = defaultKeyboardFocusArea
+            return
+        }
+        keyboardFocusArea = areas[(currentIndex + 1) % areas.count]
+    }
+
+    private func focusPreviousArea() {
+        let areas = availableKeyboardFocusAreas
+        guard !areas.isEmpty else { return }
+        guard let currentIndex = areas.firstIndex(of: keyboardFocusArea) else {
+            keyboardFocusArea = defaultKeyboardFocusArea
+            return
+        }
+        keyboardFocusArea = areas[(currentIndex - 1 + areas.count) % areas.count]
+    }
+
+    private func handleNavigationCommandInCurrentFocus(_ command: KeyboardNavigationCommand) {
+        switch keyboardFocusArea {
+        case .topTabs:
+            handleTopTabsNavigation(command)
+        case .compactList, .compactMoreDetailsButton, .compactPrimaryActionButton:
+            handleCompactNavigation(command)
+        case .performanceSidebar, .performanceDetail:
+            handlePerformanceNavigation(command)
+        case .processTable:
+            handleProcessNavigation(command)
+        case .footerToggleCompact, .footerPrimaryAction:
+            handleFooterNavigation(command)
+        }
+    }
+
+    private func handleTopTabsNavigation(_ command: KeyboardNavigationCommand) {
+        switch command {
+        case .moveLeft:
+            cycleSelectedTab(step: -1)
+        case .moveRight:
+            cycleSelectedTab(step: 1)
+        case .moveDown:
+            keyboardFocusArea = nextPrimaryContentFocusArea()
+        case .activatePrimary, .activateSecondary:
+            break
+        case .back:
+            break
+        case .cancel:
+            activeMenu = nil
+        default:
+            break
+        }
+    }
+
+    private func handleCompactNavigation(_ command: KeyboardNavigationCommand) {
+        switch keyboardFocusArea {
+        case .compactList:
+            switch command {
+            case .moveUp:
+                moveCompactSelection(step: -1)
+            case .moveDown:
+                moveCompactSelection(step: 1)
+            case .moveLeft:
+                cycleSelectedTab(step: -1)
+            case .moveRight:
+                cycleSelectedTab(step: 1)
+            case .activatePrimary, .activateSecondary:
+                toggleCompactMode()
+            default:
+                break
+            }
+        case .compactMoreDetailsButton:
+            switch command {
+            case .moveLeft:
+                cycleSelectedTab(step: -1)
+            case .moveRight:
+                cycleSelectedTab(step: 1)
+            case .moveUp, .back:
+                keyboardFocusArea = .compactList
+            case .activatePrimary, .activateSecondary:
+                toggleCompactMode()
+            default:
+                break
+            }
+        case .compactPrimaryActionButton:
+            switch command {
+            case .moveLeft:
+                cycleSelectedTab(step: -1)
+            case .moveRight:
+                cycleSelectedTab(step: 1)
+            case .moveUp, .back:
+                keyboardFocusArea = .compactList
+            case .activatePrimary, .activateSecondary:
+                performPrimaryTaskAction()
+            default:
+                break
+            }
+        default:
+            break
+        }
+    }
+
+    private func handlePerformanceNavigation(_ command: KeyboardNavigationCommand) {
+        switch keyboardFocusArea {
+        case .performanceSidebar:
+            switch command {
+            case .moveUp:
+                movePerformanceSelection(step: -1)
+            case .moveDown:
+                movePerformanceSelection(step: 1)
+            case .moveLeft:
+                cycleSelectedTab(step: -1)
+            case .moveRight:
+                cycleSelectedTab(step: 1)
+            case .activatePrimary, .activateSecondary:
+                if performanceViewMode != .summary {
+                    keyboardFocusArea = .performanceDetail
+                }
+            default:
+                break
+            }
+        case .performanceDetail:
+            switch command {
+            case .moveLeft:
+                cycleSelectedTab(step: -1)
+            case .moveRight:
+                cycleSelectedTab(step: 1)
+            default:
+                break
+            }
+        default:
+            break
+        }
+    }
+
+    private func handleProcessNavigation(_ command: KeyboardNavigationCommand) {
+        let items = processKeyboardItems
+        guard !items.isEmpty else { return }
+
+        if currentProcessKeyboardItem == nil {
+            applyProcessKeyboardSelection(items[0])
+        }
+
+        switch command {
+        case .moveUp:
+            moveProcessSelection(step: -1)
+        case .moveDown:
+            moveProcessSelection(step: 1)
+        case .moveLeft:
+            cycleSelectedTab(step: -1)
+        case .moveRight:
+            cycleSelectedTab(step: 1)
+        case .activatePrimary, .activateSecondary:
+            handleProcessActivate()
+        case .back:
+            handleProcessMoveLeft()
+        default:
+            break
+        }
+    }
+
+    private func handleFooterNavigation(_ command: KeyboardNavigationCommand) {
+        switch keyboardFocusArea {
+        case .footerToggleCompact:
+            switch command {
+            case .moveLeft:
+                cycleSelectedTab(step: -1)
+            case .moveRight:
+                cycleSelectedTab(step: 1)
+            case .moveUp, .back:
+                keyboardFocusArea = nextPrimaryContentFocusArea()
+            case .activatePrimary, .activateSecondary:
+                toggleCompactMode()
+            default:
+                break
+            }
+        case .footerPrimaryAction:
+            switch command {
+            case .moveLeft:
+                cycleSelectedTab(step: -1)
+            case .moveRight:
+                cycleSelectedTab(step: 1)
+            case .moveUp, .back:
+                keyboardFocusArea = nextPrimaryContentFocusArea()
+            case .activatePrimary, .activateSecondary:
+                performPrimaryTaskAction()
+            default:
+                break
+            }
+        default:
+            break
+        }
+    }
+
+    private func handleMenuKeyboardNavigation(_ command: KeyboardNavigationCommand) {
+        guard let context = menuKeyboardContext ?? activeMenu.map({ .main($0) }) else { return }
+
+        switch command {
+        case .moveUp:
+            moveMenuKeyboardSelection(in: context, step: -1)
+        case .moveDown:
+            moveMenuKeyboardSelection(in: context, step: 1)
+        case .activatePrimary, .activateSecondary:
+            activateMenuKeyboardSelection(in: context)
+        case .back:
+            handleMenuKeyboardBack(from: context)
+        case .cancel:
+            activeMenu = nil
+        default:
+            break
+        }
+    }
+
+    private func moveMenuKeyboardSelection(in context: MenuKeyboardContext, step: Int) {
+        let count = menuKeyboardItemCount(for: context)
+        guard count > 0 else { return }
+        if menuKeyboardContext != context {
+            menuKeyboardContext = context
+            menuKeyboardIndex = 0
+            return
+        }
+        menuKeyboardIndex = (menuKeyboardIndex + step + count) % count
+    }
+
+    private func menuKeyboardItemCount(for context: MenuKeyboardContext) -> Int {
+        switch context {
+        case .main(.file):
+            return 2
+        case .main(.options):
+            return 6
+        case .main(.view):
+            return 4
+        case .optionsSubmenu(.language):
+            return 2
+        case .optionsSubmenu(.temperatureUnit):
+            return 2
+        case .optionsSubmenu(.menuStyle):
+            return MenuVisualStyle.allCases.count
+        case .viewSubmenu(.refreshSpeed):
+            return RefreshSpeedOption.allCases.count
+        }
+    }
+
+    private func isMenuKeyboardFocused(_ context: MenuKeyboardContext, index: Int) -> Bool {
+        menuKeyboardContext == context && menuKeyboardIndex == index
+    }
+
+    private func activateMenuKeyboardSelection(in context: MenuKeyboardContext) {
+        switch context {
+        case .main(.file):
+            switch menuKeyboardIndex {
+            case 0:
+                if commandKeyPressed {
+                    openNewTerminalWindow()
+                } else {
+                    newTaskPanelManager.show(language: language)
+                }
+                activeMenu = nil
+            case 1:
+                NSApp.terminate(nil)
+            default:
+                break
+            }
+        case .main(.options):
+            switch menuKeyboardIndex {
+            case 0:
+                alwaysOnTop.toggle()
+                activeMenu = nil
+            case 1:
+                useSmallValues.toggle()
+                activeMenu = nil
+            case 2:
+                hideWhenMinimized.toggle()
+                activeMenu = nil
+            case 3:
+                activeOptionsSubmenu = .language
+                menuKeyboardContext = .optionsSubmenu(.language)
+                menuKeyboardIndex = 0
+            case 4:
+                activeOptionsSubmenu = .temperatureUnit
+                menuKeyboardContext = .optionsSubmenu(.temperatureUnit)
+                menuKeyboardIndex = 0
+            case 5:
+                activeOptionsSubmenu = .menuStyle
+                menuKeyboardContext = .optionsSubmenu(.menuStyle)
+                menuKeyboardIndex = 0
+            default:
+                break
+            }
+        case .main(.view):
+            switch menuKeyboardIndex {
+            case 0:
+                monitor.refreshNow()
+                activeMenu = nil
+            case 1:
+                activeViewSubmenu = .refreshSpeed
+                menuKeyboardContext = .viewSubmenu(.refreshSpeed)
+                menuKeyboardIndex = 0
+            case 2:
+                collapsedSections.removeAll()
+                activeMenu = nil
+            case 3:
+                collapsedSections = Set(monitor.processSections.map(\.kind))
+                activeMenu = nil
+            default:
+                break
+            }
+        case .optionsSubmenu(.language):
+            language = menuKeyboardIndex == 0 ? .chinese : .english
+            activeOptionsSubmenu = nil
+            activeMenu = nil
+        case .optionsSubmenu(.temperatureUnit):
+            temperatureUnit = menuKeyboardIndex == 0 ? .celsius : .fahrenheit
+            activeOptionsSubmenu = nil
+            activeMenu = nil
+        case .optionsSubmenu(.menuStyle):
+            let styles = MenuVisualStyle.allCases
+            guard styles.indices.contains(menuKeyboardIndex) else { return }
+            setMenuVisualStyle(styles[menuKeyboardIndex])
+            activeOptionsSubmenu = nil
+            activeMenu = nil
+        case .viewSubmenu(.refreshSpeed):
+            let options = RefreshSpeedOption.allCases
+            guard options.indices.contains(menuKeyboardIndex) else { return }
+            monitor.setRefreshSpeed(options[menuKeyboardIndex])
+            activeViewSubmenu = nil
+            activeMenu = nil
+        }
+    }
+
+    private func handleMenuKeyboardBack(from context: MenuKeyboardContext) {
+        switch context {
+        case .main:
+            activeMenu = nil
+        case .optionsSubmenu(let submenu):
+            activeOptionsSubmenu = nil
+            menuKeyboardContext = .main(.options)
+            menuKeyboardIndex = menuKeyboardMainIndex(for: submenu)
+        case .viewSubmenu(.refreshSpeed):
+            activeViewSubmenu = nil
+            menuKeyboardContext = .main(.view)
+            menuKeyboardIndex = 1
+        }
+    }
+
+    private func menuKeyboardMainIndex(for submenu: OptionsSubmenuKind) -> Int {
+        switch submenu {
+        case .language:
+            return 3
+        case .temperatureUnit:
+            return 4
+        case .menuStyle:
+            return 5
+        }
+    }
+
+    private func nextPrimaryContentFocusArea() -> KeyboardFocusArea {
+        if compactMode {
+            return .compactList
+        }
+        if selectedTab == .performance {
+            return .performanceSidebar
+        }
+        if selectedTab == .processes {
+            return .processTable
+        }
+        return .topTabs
+    }
+
+    private func cycleSelectedTab(step: Int) {
+        let tabs = TaskTab.allCases
+        guard let currentIndex = tabs.firstIndex(of: selectedTab) else { return }
+        let nextIndex = (currentIndex + step + tabs.count) % tabs.count
+        selectedTab = tabs[nextIndex]
+    }
+
+    private func moveCompactSelection(step: Int) {
+        guard !compactApplicationRows.isEmpty else { return }
+        let currentIndex = compactApplicationRows.firstIndex(where: { $0.pid == selectedProcessPID }) ?? 0
+        let nextIndex = max(0, min(currentIndex + step, compactApplicationRows.count - 1))
+        selectedProcessPID = compactApplicationRows[nextIndex].pid
+    }
+
+    private var sortedProcessSectionsForKeyboard: [ProcessSectionData] {
+        monitor.processSections.map { section in
+            ProcessSectionData(kind: section.kind, rows: section.rows.sorted(by: compareProcessRowsForKeyboard))
+        }
+    }
+
+    private var processKeyboardItems: [ProcessKeyboardItem] {
+        var items: [ProcessKeyboardItem] = []
+        for section in sortedProcessSectionsForKeyboard {
+            items.append(.section(section.kind))
+            if !collapsedSections.contains(section.kind) {
+                items.append(contentsOf: section.rows.map { .row(section.kind, $0.pid) })
+            }
+        }
+        return items
+    }
+
+    private var currentProcessKeyboardItem: ProcessKeyboardItem? {
+        if let sectionKind = selectedProcessSectionKind {
+            return .section(sectionKind)
+        }
+        if let pid = selectedProcessPID,
+           let item = processKeyboardItems.first(where: {
+               if case .row(_, let rowPID) = $0 {
+                   return rowPID == pid
+               }
+               return false
+           }) {
+            return item
+        }
+        return nil
+    }
+
+    private func applyProcessKeyboardSelection(_ item: ProcessKeyboardItem) {
+        switch item {
+        case .section(let kind):
+            selectedProcessSectionKind = kind
+            selectedProcessPID = nil
+        case .row(_, let pid):
+            selectedProcessSectionKind = nil
+            selectedProcessPID = pid
+        }
+    }
+
+    private func moveProcessSelection(step: Int) {
+        let items = processKeyboardItems
+        guard !items.isEmpty else { return }
+        let currentIndex = currentProcessKeyboardItem.flatMap { current in
+            items.firstIndex(of: current)
+        } ?? 0
+        let nextIndex = max(0, min(currentIndex + step, items.count - 1))
+        applyProcessKeyboardSelection(items[nextIndex])
+    }
+
+    private func handleProcessMoveLeft() {
+        guard let selection = currentProcessKeyboardItem else { return }
+        switch selection {
+        case .section(let kind):
+            if !collapsedSections.contains(kind) {
+                collapsedSections.insert(kind)
+            }
+        case .row(let kind, _):
+            selectedProcessSectionKind = kind
+            selectedProcessPID = nil
+        }
+    }
+
+    private func handleProcessActivate() {
+        guard let selection = currentProcessKeyboardItem else { return }
+        switch selection {
+        case .section(let kind):
+            if collapsedSections.contains(kind) {
+                collapsedSections.remove(kind)
+            } else {
+                collapsedSections.insert(kind)
+            }
+        case .row(_, let pid):
+            openDetailsTab(pid)
+        }
+    }
+
+    private func movePerformanceSelection(step: Int) {
+        let items = monitor.sidebarItems.map(\.id)
+        guard !items.isEmpty else { return }
+        let currentIndex = items.firstIndex(of: selectedPerf) ?? 0
+        let nextIndex = max(0, min(currentIndex + step, items.count - 1))
+        requestPerformanceSelection(items[nextIndex])
+    }
+
+    private func compareProcessRowsForKeyboard(_ lhs: ProcessRowData, _ rhs: ProcessRowData) -> Bool {
+        let result: Bool
+        switch processSortKey {
+        case .name:
+            result = lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+        case .status:
+            result = true
+        case .cpu:
+            result = lhs.cpuPercent < rhs.cpuPercent
+        case .memory:
+            result = lhs.memoryBytes < rhs.memoryBytes
+        case .disk:
+            result = lhs.diskBytesPerSecond < rhs.diskBytesPerSecond
+        case .network:
+            result = lhs.networkBytesPerSecond < rhs.networkBytesPerSecond
+        case .power:
+            result = lhs.powerUsageWatts < rhs.powerUsageWatts
+        case .trend:
+            result = lhs.powerTrendWatts < rhs.powerTrendWatts
+        }
+        return processSortAscending ? result : !result
+    }
+
+    private func updateFinderBarForCompactMode() {
+        DispatchQueue.main.async {
+            (NSApp.delegate as? AppDelegate)?.updateFinderBarMenuVisibility(isCompactMode: compactMode)
+        }
+    }
+
+    private var shouldRefreshDisksForCurrentPresentation: Bool {
+        !compactMode && selectedTab == .performance
+    }
+
+    private var performanceSelectionBinding: Binding<PerfSelection> {
+        Binding(
+            get: { selectedPerf },
+            set: { requestPerformanceSelection($0) }
+        )
+    }
+
+    private var highlightedPerformanceSelection: PerfSelection {
+        pendingPerformanceSelection ?? selectedPerf
+    }
+
+    private func updateDiskRefreshPolicy() {
+        monitor.setDiskRefreshEnabled(shouldRefreshDisksForCurrentPresentation)
+    }
+
+    private func loadSelectedDiskDetailsIfNeeded() {
+        guard shouldRefreshDisksForCurrentPresentation else { return }
+        guard case .disk(let diskID) = selectedPerf else { return }
+        Task { @MainActor in
+            _ = await monitor.loadDetailedDiskMetadataInBackground(forDiskID: diskID)
+        }
+    }
+
+    private func requestPerformanceSelection(_ newSelection: PerfSelection) {
+        guard shouldRefreshDisksForCurrentPresentation else {
+            pendingPerformanceSelection = nil
+            selectedPerf = newSelection
+            return
+        }
+
+        guard case .disk(let diskID) = newSelection else {
+            pendingPerformanceSelection = nil
+            selectedPerf = newSelection
+            return
+        }
+
+        if monitor.hasDetailedDiskMetadata(forDiskID: diskID) {
+            pendingPerformanceSelection = nil
+            selectedPerf = newSelection
+            return
+        }
+
+        pendingPerformanceSelection = newSelection
+        Task { @MainActor in
+            let loaded = await monitor.loadDetailedDiskMetadataInBackground(forDiskID: diskID)
+            guard pendingPerformanceSelection == newSelection else { return }
+            pendingPerformanceSelection = nil
+            if loaded {
+                selectedPerf = newSelection
+            }
+        }
+    }
+
+    private func syncFinderBarCommandState() {
+        finderBarCommandState.sync(
+            language: language,
+            temperatureUnit: temperatureUnit,
+            menuVisualStyle: menuVisualStyle,
+            alwaysOnTop: alwaysOnTop,
+            useSmallValues: useSmallValues,
+            hideWhenMinimized: hideWhenMinimized,
+            refreshSpeed: monitor.refreshSpeed,
+            compactMode: compactMode
+        )
+    }
+
+    private func handleFinderBarCommand(_ notification: Notification) {
+        guard
+            let rawValue = notification.userInfo?["command"] as? String,
+            let command = FinderBarCommand(rawValue: rawValue)
+        else { return }
+
+        switch command {
+        case .runNewTask:
+            newTaskPanelManager.show(language: language)
+        case .showAbout:
+            aboutPanelManager.show(language: language)
+        case .quitApp:
+            NSApp.terminate(nil)
+        case .toggleAlwaysOnTop:
+            alwaysOnTop.toggle()
+        case .toggleUseSmallValues:
+            useSmallValues.toggle()
+        case .toggleHideWhenMinimized:
+            hideWhenMinimized.toggle()
+        case .refreshNow:
+            monitor.refreshNow()
+        case .expandAll:
+            collapsedSections.removeAll()
+        case .collapseAll:
+            collapsedSections = Set(monitor.processSections.map(\.kind))
+        case .setLanguage:
+            if let value = notification.userInfo?["value"] as? String,
+               let nextLanguage = AppLanguage(rawValue: value) {
+                language = nextLanguage
+            }
+        case .setTemperatureUnit:
+            if let value = notification.userInfo?["value"] as? String,
+               let nextUnit = TemperatureUnit(rawValue: value) {
+                temperatureUnit = nextUnit
+            }
+        case .setMenuVisualStyle:
+            if let value = notification.userInfo?["value"] as? String,
+               let nextStyle = MenuVisualStyle(rawValue: value) {
+                setMenuVisualStyle(nextStyle)
+            }
+        case .setRefreshSpeed:
+            if let value = notification.userInfo?["value"] as? String,
+               let nextSpeed = RefreshSpeedOption(rawValue: value) {
+                monitor.setRefreshSpeed(nextSpeed)
+            }
+        }
+    }
+
+    private func resetMenuHoverState() {
+        hoveredOptionsSubmenuParent = nil
+        optionsSubmenuHovered = false
+        activeOptionsSubmenu = nil
+        hoveredViewSubmenuParent = nil
+        viewSubmenuHovered = false
+        activeViewSubmenu = nil
+        menuKeyboardContext = activeMenu.map { .main($0) }
+        menuKeyboardIndex = 0
+    }
+
+    private enum OptionsSubmenuKind {
+        case language
+        case temperatureUnit
+        case menuStyle
+    }
+
+    private enum MenuKeyboardContext: Equatable {
+        case main(MenuKind)
+        case optionsSubmenu(OptionsSubmenuKind)
+        case viewSubmenu(ViewSubmenuKind)
+    }
+
+    private func activateOptionsSubmenu(_ kind: OptionsSubmenuKind) {
+        hoveredOptionsSubmenuParent = kind
+        activeOptionsSubmenu = kind
+    }
+
+    private func setOptionsSubmenuParentHover(_ kind: OptionsSubmenuKind, hovering: Bool) {
+        if hovering {
+            hoveredOptionsSubmenuParent = kind
+            activeOptionsSubmenu = kind
+        } else if hoveredOptionsSubmenuParent == kind {
+            hoveredOptionsSubmenuParent = nil
+            scheduleOptionsSubmenuCloseIfNeeded()
+        }
+    }
+
+    private func setOptionsSubmenuHover(_ hovering: Bool) {
+        optionsSubmenuHovered = hovering
+        if !hovering {
+            scheduleOptionsSubmenuCloseIfNeeded()
+        }
+    }
+
+    private func scheduleOptionsSubmenuCloseIfNeeded() {
+        DispatchQueue.main.async {
+            guard hoveredOptionsSubmenuParent == nil, !optionsSubmenuHovered else { return }
+            activeOptionsSubmenu = nil
+        }
+    }
+
+    private enum ViewSubmenuKind {
+        case refreshSpeed
+    }
+
+    private func activateViewSubmenu(_ kind: ViewSubmenuKind) {
+        hoveredViewSubmenuParent = kind
+        activeViewSubmenu = kind
+    }
+
+    private func setViewSubmenuParentHover(_ kind: ViewSubmenuKind, hovering: Bool) {
+        if hovering {
+            hoveredViewSubmenuParent = kind
+            activeViewSubmenu = kind
+        } else if hoveredViewSubmenuParent == kind {
+            hoveredViewSubmenuParent = nil
+            scheduleViewSubmenuCloseIfNeeded()
+        }
+    }
+
+    private func setViewSubmenuHover(_ hovering: Bool) {
+        viewSubmenuHovered = hovering
+        if !hovering {
+            scheduleViewSubmenuCloseIfNeeded()
+        }
+    }
+
+    private func scheduleViewSubmenuCloseIfNeeded() {
+        DispatchQueue.main.async {
+            guard hoveredViewSubmenuParent == nil, !viewSubmenuHovered else { return }
+            activeViewSubmenu = nil
+        }
     }
 
     private func menuXOffset(for menu: MenuKind) -> CGFloat {
-        switch menu {
-        case .file: 14
-        case .options: 72
-        case .view: 140
+        let baseX: CGFloat = 14
+        let chromeMenuSpacing: CGFloat = 16
+        let chromeButtonHorizontalPadding: CGFloat = 4
+
+        func chromeButtonWidth(_ title: String) -> CGFloat {
+            ceil(textWidth(title, size: 14) + chromeButtonHorizontalPadding)
         }
+
+        let fileWidth = chromeButtonWidth(language.text("文件(F)", "File(F)"))
+        let optionsWidth = chromeButtonWidth(language.text("选项(O)", "Options(O)"))
+
+        switch menu {
+        case .file:
+            return baseX
+        case .options:
+            return baseX + fileWidth + chromeMenuSpacing
+        case .view:
+            return baseX + fileWidth + chromeMenuSpacing + optionsWidth + chromeMenuSpacing
+        }
+    }
+
+    private var menuRowHeight: CGFloat { 28 }
+    private var menuDividerHeight: CGFloat { 1 }
+    private var submenuGap: CGFloat { 0 }
+    private var menuHorizontalPadding: CGFloat { 10 }
+    private var menuItemSpacing: CGFloat { 8 }
+    private var menuLeadingIconWidth: CGFloat { 12 }
+    private var menuChevronWidth: CGFloat { 10 }
+    private var menuTrailingInset: CGFloat { 12 }
+    private var menuMinimumWidth: CGFloat { 120 }
+    private var menuWidthSlack: CGFloat { 22 }
+
+    private func submenuTopOffset(rowIndex: Int, dividerCountBefore: Int = 0) -> CGFloat {
+        (CGFloat(rowIndex) * menuRowHeight) + (CGFloat(dividerCountBefore) * menuDividerHeight) - 1
+    }
+
+    private func textWidth(
+        _ text: String,
+        size: CGFloat = 13,
+        weight: NSFont.Weight = .regular
+    ) -> CGFloat {
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: size, weight: weight)
+        ]
+        return ceil((text as NSString).size(withAttributes: attributes).width)
+    }
+
+    private func plainMenuRowWidth(_ title: String, altHint: String? = nil) -> CGFloat {
+        var width = (menuHorizontalPadding * 2) + menuLeadingIconWidth + menuItemSpacing + textWidth(title)
+        if let altHint {
+            width += menuItemSpacing + textWidth(altHint, size: 12)
+        } else {
+            width += menuTrailingInset
+        }
+        return ceil(width + menuWidthSlack)
+    }
+
+    private func submenuTriggerWidth(_ title: String) -> CGFloat {
+        let width =
+            (menuHorizontalPadding * 2) +
+            menuLeadingIconWidth +
+            menuItemSpacing +
+            textWidth(title) +
+            menuItemSpacing +
+            menuChevronWidth +
+            menuTrailingInset
+        return ceil(width + menuWidthSlack)
+    }
+
+    private func checkableMenuRowWidth(_ title: String) -> CGFloat {
+        ceil((menuHorizontalPadding * 2) + menuLeadingIconWidth + menuItemSpacing + textWidth(title) + menuTrailingInset + menuWidthSlack)
+    }
+
+    private func menuPanelWidth(for menu: MenuKind) -> CGFloat {
+        switch menu {
+        case .file:
+            return max(
+                menuMinimumWidth,
+                plainMenuRowWidth(language.text("运行新任务(N)", "Run new task(N)")),
+                plainMenuRowWidth(language.text("退出(X)", "Exit(X)"))
+            )
+        case .options:
+            return max(
+                menuMinimumWidth,
+                checkableMenuRowWidth(language.text("置于顶层(A)", "Always on top(A)")),
+                checkableMenuRowWidth(language.text("使用小值(U)", "Use small values(U)")),
+                checkableMenuRowWidth(language.text("最小化时隐藏(H)", "Hide when minimized(H)")),
+                submenuTriggerWidth(language.text("语言", "Language")),
+                submenuTriggerWidth(language.text("温度单位", "Temperature unit")),
+                submenuTriggerWidth(language.text("菜单风格", "Menu style"))
+            )
+        case .view:
+            return max(
+                menuMinimumWidth,
+                plainMenuRowWidth(language.text("立即刷新(R)", "Refresh now(R)")),
+                submenuTriggerWidth(language.text("更新速度(U)", "Update speed(U)")),
+                plainMenuRowWidth(language.text("全部展开(E)", "Expand all(E)")),
+                plainMenuRowWidth(language.text("全部折叠(C)", "Collapse all(C)"))
+            )
+        }
+    }
+
+    private var refreshSpeedSubmenuWidth: CGFloat {
+        max(
+            menuMinimumWidth,
+            RefreshSpeedOption.allCases.map { checkableMenuRowWidth($0.title(in: language)) }.max() ?? menuMinimumWidth
+        )
+    }
+
+    private var languageSubmenuWidth: CGFloat {
+        max(
+            menuMinimumWidth,
+            checkableMenuRowWidth("中文"),
+            checkableMenuRowWidth("English")
+        )
+    }
+
+    private var temperatureUnitSubmenuWidth: CGFloat {
+        max(
+            menuMinimumWidth,
+            checkableMenuRowWidth(language.text("摄氏度°C", "Celsius °C")),
+            checkableMenuRowWidth(language.text("华氏度°F", "Fahrenheit °F"))
+        )
+    }
+
+    private var menuStyleSubmenuWidth: CGFloat {
+        max(
+            menuMinimumWidth,
+            MenuVisualStyle.allCases.map { checkableMenuRowWidth($0.title(in: language)) }.max() ?? menuMinimumWidth
+        )
     }
 
     @ViewBuilder
     private func menuOverlay(for menu: MenuKind) -> some View {
         switch menu {
         case .file:
-            menuPanel {
-                menuItem(language.text("运行新任务(N)", "Run new task(N)"), altHint: nil) {
+            menuPanel(for: .file) {
+                menuItem(language.text("运行新任务(N)", "Run new task(N)"), altHint: nil, highlighted: isMenuKeyboardFocused(.main(.file), index: 0)) {
                     if commandKeyPressed {
                         openNewTerminalWindow()
                     } else {
@@ -378,63 +1377,86 @@ struct RootWindowView: View {
                     activeMenu = nil
                 }
                 Divider()
-                menuItem(language.text("关于", "About"), altHint: nil) {
-                    aboutPanelManager.show(language: language)
-                    activeMenu = nil
-                }
-                Divider()
-                menuItem(language.text("退出(X)", "Exit(X)"), altHint: nil) {
+                menuItem(language.text("退出(X)", "Exit(X)"), altHint: nil, highlighted: isMenuKeyboardFocused(.main(.file), index: 1)) {
                     NSApp.terminate(nil)
                 }
             }
         case .options:
-            menuPanel {
-                checkableMenuItem(language.text("置于顶层(A)", "Always on top(A)"), checked: alwaysOnTop) {
-                    alwaysOnTop.toggle()
-                    activeMenu = nil
+            ZStack(alignment: .topLeading) {
+                menuPanel(for: .options) {
+                    checkableMenuItem(language.text("置于顶层(A)", "Always on top(A)"), checked: alwaysOnTop, highlighted: isMenuKeyboardFocused(.main(.options), index: 0)) {
+                        alwaysOnTop.toggle()
+                        activeMenu = nil
+                    }
+                    checkableMenuItem(language.text("使用小值(U)", "Use small values(U)"), checked: useSmallValues, highlighted: isMenuKeyboardFocused(.main(.options), index: 1)) {
+                        useSmallValues.toggle()
+                        activeMenu = nil
+                    }
+                    checkableMenuItem(language.text("最小化时隐藏(H)", "Hide when minimized(H)"), checked: hideWhenMinimized, highlighted: isMenuKeyboardFocused(.main(.options), index: 2)) {
+                        hideWhenMinimized.toggle()
+                        activeMenu = nil
+                    }
+                    Divider()
+                    optionsSubmenuItem(
+                        language.text("语言", "Language"),
+                        expanded: activeOptionsSubmenu == .language || isMenuKeyboardFocused(.main(.options), index: 3),
+                        action: { activateOptionsSubmenu(.language) },
+                        onParentHover: { setOptionsSubmenuParentHover(.language, hovering: $0) }
+                    )
+                    optionsSubmenuItem(
+                        language.text("温度单位", "Temperature unit"),
+                        expanded: activeOptionsSubmenu == .temperatureUnit || isMenuKeyboardFocused(.main(.options), index: 4),
+                        action: { activateOptionsSubmenu(.temperatureUnit) },
+                        onParentHover: { setOptionsSubmenuParentHover(.temperatureUnit, hovering: $0) }
+                    )
+                    optionsSubmenuItem(
+                        language.text("菜单风格", "Menu style"),
+                        expanded: activeOptionsSubmenu == .menuStyle || isMenuKeyboardFocused(.main(.options), index: 5),
+                        action: { activateOptionsSubmenu(.menuStyle) },
+                        onParentHover: { setOptionsSubmenuParentHover(.menuStyle, hovering: $0) }
+                    )
                 }
-                checkableMenuItem(language.text("使用小值(U)", "Use small values(U)"), checked: useSmallValues) {
-                    useSmallValues.toggle()
-                    activeMenu = nil
-                }
-                checkableMenuItem(language.text("最小化时隐藏(H)", "Hide when minimized(H)"), checked: hideWhenMinimized) {
-                    hideWhenMinimized.toggle()
-                    activeMenu = nil
-                }
-                Divider()
-                subMenuItem(language.text("语言", "Language"), expanded: showLanguageSubmenu) {
-                    languageMenu
-                } action: {}
-                .onHover { hovering in
-                    languageParentHovered = hovering
-                }
-                subMenuItem(language.text("温度单位", "Temperature unit"), expanded: showTemperatureUnitSubmenu) {
-                    temperatureUnitMenu
-                } action: {}
-                .onHover { hovering in
-                    temperatureUnitParentHovered = hovering
+
+                if let activeOptionsSubmenu {
+                    optionsSubmenuOverlay(for: activeOptionsSubmenu)
+                        .offset(
+                            x: menuPanelWidth(for: .options) + submenuGap,
+                            y: optionsSubmenuYOffset(for: activeOptionsSubmenu)
+                        )
+                        .zIndex(20)
                 }
             }
         case .view:
-            menuPanel {
-                menuItem(language.text("立即刷新(R)", "Refresh now(R)"), altHint: nil) {
-                    monitor.refreshNow()
-                    activeMenu = nil
+            ZStack(alignment: .topLeading) {
+                menuPanel(for: .view) {
+                    menuItem(language.text("立即刷新(R)", "Refresh now(R)"), altHint: nil, highlighted: isMenuKeyboardFocused(.main(.view), index: 0)) {
+                        monitor.refreshNow()
+                        activeMenu = nil
+                    }
+                    optionsSubmenuItem(
+                        language.text("更新速度(U)", "Update speed(U)"),
+                        expanded: activeViewSubmenu == .refreshSpeed || isMenuKeyboardFocused(.main(.view), index: 1),
+                        action: { activateViewSubmenu(.refreshSpeed) },
+                        onParentHover: { setViewSubmenuParentHover(.refreshSpeed, hovering: $0) }
+                    )
+                    Divider()
+                    menuItem(language.text("全部展开(E)", "Expand all(E)"), altHint: nil, highlighted: isMenuKeyboardFocused(.main(.view), index: 2)) {
+                        collapsedSections.removeAll()
+                        activeMenu = nil
+                    }
+                    menuItem(language.text("全部折叠(C)", "Collapse all(C)"), altHint: nil, highlighted: isMenuKeyboardFocused(.main(.view), index: 3)) {
+                        collapsedSections = Set(monitor.processSections.map(\.kind))
+                        activeMenu = nil
+                    }
                 }
-                subMenuItem(language.text("更新速度(U)", "Update speed(U)"), expanded: showRefreshSpeedSubmenu) {
-                    refreshSpeedSubmenu
-                } action: {
-                    showRefreshSpeedSubmenu = true
-                    refreshSpeedParentHovered = true
-                }
-                Divider()
-                menuItem(language.text("全部展开(E)", "Expand all(E)"), altHint: nil) {
-                    collapsedSections.removeAll()
-                    activeMenu = nil
-                }
-                menuItem(language.text("全部折叠(C)", "Collapse all(C)"), altHint: nil) {
-                    collapsedSections = Set(monitor.processSections.map(\.title))
-                    activeMenu = nil
+
+                if let activeViewSubmenu {
+                    viewSubmenuOverlay(for: activeViewSubmenu)
+                        .offset(
+                            x: menuPanelWidth(for: .view) + submenuGap,
+                            y: viewSubmenuYOffset(for: activeViewSubmenu)
+                        )
+                        .zIndex(20)
                 }
             }
         }
@@ -442,10 +1464,10 @@ struct RootWindowView: View {
 
     private var refreshSpeedSubmenu: some View {
         VStack(spacing: 0) {
-            ForEach(RefreshSpeedOption.allCases) { option in
+            ForEach(Array(RefreshSpeedOption.allCases.enumerated()), id: \.element.id) { index, option in
                 Button {
                     monitor.setRefreshSpeed(option)
-                    showRefreshSpeedSubmenu = false
+                    activeViewSubmenu = nil
                     activeMenu = nil
                 } label: {
                     HStack(spacing: 8) {
@@ -460,22 +1482,19 @@ struct RootWindowView: View {
                     .frame(height: 28)
                     .contentShape(Rectangle())
                 }
-                .buttonStyle(WinMenuButtonStyle())
+                .buttonStyle(WinMenuButtonStyle(isHighlighted: isMenuKeyboardFocused(.viewSubmenu(.refreshSpeed), index: index)))
             }
         }
-        .frame(width: 124)
+        .frame(width: refreshSpeedSubmenuWidth)
         .winMenuPanel()
-        .offset(x: 167, y: -1)
-        .onHover { hovering in
-            refreshSpeedSubmenuHovered = hovering
-        }
+        .onHover(perform: setViewSubmenuHover)
     }
 
     private var languageMenu: some View {
         VStack(spacing: 0) {
             Button {
                 language = .chinese
-                showLanguageSubmenu = false
+                activeOptionsSubmenu = nil
                 activeMenu = nil
             } label: {
                 HStack(spacing: 8) {
@@ -489,11 +1508,11 @@ struct RootWindowView: View {
                 .padding(.horizontal, 10)
                 .frame(height: 28)
             }
-            .buttonStyle(WinMenuButtonStyle())
+            .buttonStyle(WinMenuButtonStyle(isHighlighted: isMenuKeyboardFocused(.optionsSubmenu(.language), index: 0)))
 
             Button {
                 language = .english
-                showLanguageSubmenu = false
+                activeOptionsSubmenu = nil
                 activeMenu = nil
             } label: {
                 HStack(spacing: 8) {
@@ -507,21 +1526,18 @@ struct RootWindowView: View {
                 .padding(.horizontal, 10)
                 .frame(height: 28)
             }
-            .buttonStyle(WinMenuButtonStyle())
+            .buttonStyle(WinMenuButtonStyle(isHighlighted: isMenuKeyboardFocused(.optionsSubmenu(.language), index: 1)))
         }
-        .frame(width: 132)
+        .frame(width: languageSubmenuWidth)
         .winMenuPanel()
-        .offset(x: 167, y: -1)
-        .onHover { hovering in
-            languageSubmenuHovered = hovering
-        }
+        .onHover(perform: setOptionsSubmenuHover)
     }
 
     private var temperatureUnitMenu: some View {
         VStack(spacing: 0) {
             Button {
                 temperatureUnit = .celsius
-                showTemperatureUnitSubmenu = false
+                activeOptionsSubmenu = nil
                 activeMenu = nil
             } label: {
                 HStack(spacing: 8) {
@@ -535,11 +1551,11 @@ struct RootWindowView: View {
                 .padding(.horizontal, 10)
                 .frame(height: 28)
             }
-            .buttonStyle(WinMenuButtonStyle())
+            .buttonStyle(WinMenuButtonStyle(isHighlighted: isMenuKeyboardFocused(.optionsSubmenu(.temperatureUnit), index: 0)))
 
             Button {
                 temperatureUnit = .fahrenheit
-                showTemperatureUnitSubmenu = false
+                activeOptionsSubmenu = nil
                 activeMenu = nil
             } label: {
                 HStack(spacing: 8) {
@@ -553,23 +1569,47 @@ struct RootWindowView: View {
                 .padding(.horizontal, 10)
                 .frame(height: 28)
             }
-            .buttonStyle(WinMenuButtonStyle())
+            .buttonStyle(WinMenuButtonStyle(isHighlighted: isMenuKeyboardFocused(.optionsSubmenu(.temperatureUnit), index: 1)))
         }
-        .frame(width: 170)
+        .frame(width: temperatureUnitSubmenuWidth)
         .winMenuPanel()
-        .offset(x: 167, y: -1)
-        .onHover { hovering in
-            temperatureUnitSubmenuHovered = hovering
-        }
+        .onHover(perform: setOptionsSubmenuHover)
     }
 
-    private func menuPanel<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+    private var menuStyleMenu: some View {
+        VStack(spacing: 0) {
+            ForEach(Array(MenuVisualStyle.allCases.enumerated()), id: \.element.id) { index, style in
+                Button {
+                    setMenuVisualStyle(style)
+                    activeOptionsSubmenu = nil
+                    activeMenu = nil
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: menuVisualStyle == style ? "checkmark" : "")
+                            .font(.system(size: 10, weight: .bold))
+                            .frame(width: 12)
+                        Text(style.title(in: language))
+                            .font(.system(size: 13))
+                        Spacer()
+                    }
+                    .padding(.horizontal, 10)
+                    .frame(height: 28)
+                }
+                .buttonStyle(WinMenuButtonStyle(isHighlighted: isMenuKeyboardFocused(.optionsSubmenu(.menuStyle), index: index)))
+            }
+        }
+        .frame(width: menuStyleSubmenuWidth)
+        .winMenuPanel()
+        .onHover(perform: setOptionsSubmenuHover)
+    }
+
+    private func menuPanel<Content: View>(for menu: MenuKind, @ViewBuilder content: () -> Content) -> some View {
         VStack(spacing: 0, content: content)
-            .frame(width: 168)
+            .frame(width: menuPanelWidth(for: menu))
             .winMenuPanel()
     }
 
-    private func menuItem(_ title: String, altHint: String?, action: @escaping () -> Void) -> some View {
+    private func menuItem(_ title: String, altHint: String?, highlighted: Bool = false, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             HStack(spacing: 8) {
                 Image(systemName: "")
@@ -577,18 +1617,23 @@ struct RootWindowView: View {
                     .frame(width: 12)
                 Text(title)
                     .font(.system(size: 13))
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .layoutPriority(1)
                 Spacer()
                 if let altHint {
                     Text(altHint)
                         .font(.system(size: 12))
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
                 }
             }
             .padding(.horizontal, 10)
             .frame(height: 28)
-            .contentShape(Rectangle())
+            .interactiveHitTarget()
         }
-        .buttonStyle(WinMenuButtonStyle())
+        .buttonStyle(WinMenuButtonStyle(isHighlighted: highlighted))
     }
 
     private func disabledMenuItem(_ title: String) -> some View {
@@ -602,7 +1647,7 @@ struct RootWindowView: View {
         .frame(height: 28)
     }
 
-    private func checkableMenuItem(_ title: String, checked: Bool, action: @escaping () -> Void) -> some View {
+    private func checkableMenuItem(_ title: String, checked: Bool, highlighted: Bool = false, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             HStack(spacing: 8) {
                 Image(systemName: checked ? "checkmark" : "")
@@ -610,43 +1655,125 @@ struct RootWindowView: View {
                     .frame(width: 12)
                 Text(title)
                     .font(.system(size: 13))
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .layoutPriority(1)
                 Spacer()
             }
             .padding(.horizontal, 10)
             .frame(height: 28)
-            .contentShape(Rectangle())
+            .interactiveHitTarget()
         }
-        .buttonStyle(WinMenuButtonStyle())
+        .buttonStyle(WinMenuButtonStyle(isHighlighted: highlighted))
     }
 
-    private func subMenuItem<Content: View>(_ title: String, expanded: Bool, @ViewBuilder content: () -> Content, action: @escaping () -> Void) -> some View {
-        ZStack(alignment: .topLeading) {
-            Button(action: action) {
-                HStack(spacing: 8) {
-                    Image(systemName: "")
-                        .font(.system(size: 10, weight: .bold))
-                        .frame(width: 12)
-                    Text(title)
-                        .font(.system(size: 13))
-                    Spacer()
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                }
-                .padding(.horizontal, 10)
-                .frame(height: 28)
-                .contentShape(Rectangle())
+    private func subMenuItem<Content: View>(
+        _ title: String,
+        expanded: Bool,
+        @ViewBuilder content: () -> Content,
+        action: @escaping () -> Void,
+        onParentHover: @escaping (Bool) -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Image(systemName: "")
+                    .font(.system(size: 10, weight: .bold))
+                    .frame(width: 12)
+                Text(title)
+                    .font(.system(size: 13))
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .layoutPriority(1)
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
             }
-            .buttonStyle(WinMenuButtonStyle())
-            .onHover { hovering in
-                refreshSpeedParentHovered = hovering
-            }
-
+            .padding(.horizontal, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(height: menuRowHeight)
+            .interactiveHitTarget()
+        }
+        .buttonStyle(WinMenuButtonStyle(isHighlighted: expanded))
+        .onHover(perform: onParentHover)
+        .overlay(alignment: .topLeading) {
             if expanded {
                 content()
             }
         }
-        .frame(height: 28, alignment: .topLeading)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(height: menuRowHeight, alignment: .topLeading)
+        .zIndex(expanded ? 50 : 0)
+    }
+
+    private func optionsSubmenuItem(
+        _ title: String,
+        expanded: Bool,
+        action: @escaping () -> Void,
+        onParentHover: @escaping (Bool) -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Image(systemName: "")
+                    .font(.system(size: 10, weight: .bold))
+                    .frame(width: 12)
+                Text(title)
+                    .font(.system(size: 13))
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .layoutPriority(1)
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(height: 28)
+                .interactiveHitTarget()
+            }
+            .buttonStyle(WinMenuButtonStyle(isHighlighted: expanded))
+            .onHover(perform: onParentHover)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(height: menuRowHeight, alignment: .topLeading)
+    }
+
+    @ViewBuilder
+    private func optionsSubmenuOverlay(for kind: OptionsSubmenuKind) -> some View {
+        switch kind {
+        case .language:
+            languageMenu
+        case .temperatureUnit:
+            temperatureUnitMenu
+        case .menuStyle:
+            menuStyleMenu
+        }
+    }
+
+    private func optionsSubmenuYOffset(for kind: OptionsSubmenuKind) -> CGFloat {
+        switch kind {
+        case .language:
+            return submenuTopOffset(rowIndex: 3, dividerCountBefore: 1)
+        case .temperatureUnit:
+            return submenuTopOffset(rowIndex: 4, dividerCountBefore: 1)
+        case .menuStyle:
+            return submenuTopOffset(rowIndex: 5, dividerCountBefore: 1)
+        }
+    }
+
+    @ViewBuilder
+    private func viewSubmenuOverlay(for kind: ViewSubmenuKind) -> some View {
+        switch kind {
+        case .refreshSpeed:
+            refreshSpeedSubmenu
+        }
+    }
+
+    private func viewSubmenuYOffset(for kind: ViewSubmenuKind) -> CGFloat {
+        switch kind {
+        case .refreshSpeed:
+            return submenuTopOffset(rowIndex: 1)
+        }
     }
 
     private func updateWindowLevel(alwaysOnTop: Bool) {
@@ -973,6 +2100,205 @@ struct RootWindowView: View {
             performanceViewMode = .full
         }
     }
+
+    @ViewBuilder
+    private func nativeCheckmarkLabel(_ title: String, checked: Bool) -> some View {
+        if checked {
+            Label(title, systemImage: "checkmark")
+        } else {
+            Text(title)
+        }
+    }
+
+    private func nativeMenuBarLabel(_ title: String) -> some View {
+        Text(title)
+            .font(.system(size: 14))
+            .foregroundStyle(AppTheme.primaryText(colorScheme))
+            .padding(.horizontal, 4)
+            .frame(height: 24)
+    }
+
+    private var nativeWindowChrome: some View {
+        VStack(spacing: 0) {
+            ZStack {
+                HStack {
+                    Color.clear.frame(width: 88, height: 1)
+                    Spacer()
+                    Color.clear.frame(width: 88, height: 1)
+                }
+
+                HStack(spacing: 8) {
+                    TaskManagerGlyph()
+                    Text(language.text("任务管理器", "Task Manager"))
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(AppTheme.primaryText(colorScheme))
+                }
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 30)
+
+            HStack(spacing: 14) {
+                Menu {
+                    nativeFileMenuContent
+                } label: {
+                    nativeMenuBarLabel(language.text("文件", "File"))
+                }
+                .menuStyle(.borderlessButton)
+
+                Menu {
+                    nativeOptionsMenuContent
+                } label: {
+                    nativeMenuBarLabel(language.text("选项", "Options"))
+                }
+                .menuStyle(.borderlessButton)
+
+                Menu {
+                    nativeViewMenuContent
+                } label: {
+                    nativeMenuBarLabel(language.text("查看", "View"))
+                }
+                .menuStyle(.borderlessButton)
+
+                Spacer()
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 28)
+            .background(AppTheme.chromeBackground(colorScheme))
+
+            HStack(spacing: 2) {
+                ForEach(TaskTab.allCases) { tab in
+                    Button {
+                        selectedTab = tab
+                        activeMenu = nil
+                    } label: {
+                        Text(tab.title(in: language))
+                            .font(.system(size: 14))
+                            .foregroundStyle(AppTheme.primaryText(colorScheme))
+                            .padding(.horizontal, 8)
+                            .frame(height: 28)
+                            .background(tab == selectedTab ? AppTheme.chromeSelectedFill(colorScheme) : Color.clear)
+                            .overlay(alignment: .bottom) {
+                                Rectangle()
+                                    .fill(tab == selectedTab ? AppTheme.accentBlue : .clear)
+                                    .frame(height: 2)
+                            }
+                            .interactiveHitTarget()
+                    }
+                    .buttonStyle(.plain)
+                }
+                Spacer()
+            }
+            .padding(.horizontal, 8)
+            .frame(height: 34)
+            .padding(.bottom, 4)
+        }
+        .background {
+            ZStack {
+                VisualEffectBlur(material: .headerView, blendingMode: .withinWindow)
+                LinearGradient(
+                    colors: [
+                        colorScheme == .dark ? Color.white.opacity(0.08) : Color.white.opacity(0.34),
+                        colorScheme == .dark ? Color.white.opacity(0.03) : Color.white.opacity(0.12)
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            }
+        }
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(AppTheme.separator(colorScheme))
+                .frame(height: 1)
+        }
+    }
+
+    @ViewBuilder
+    private var nativeFileMenuContent: some View {
+        Button(language.text("运行新任务", "Run new task")) {
+            if commandKeyPressed {
+                openNewTerminalWindow()
+            } else {
+                newTaskPanelManager.show(language: language)
+            }
+        }
+        Divider()
+        Button(language.text("退出", "Exit")) {
+            NSApp.terminate(nil)
+        }
+    }
+
+    @ViewBuilder
+    private var nativeOptionsMenuContent: some View {
+        Button {
+            alwaysOnTop.toggle()
+        } label: {
+            nativeCheckmarkLabel(language.text("置于顶层", "Always on top"), checked: alwaysOnTop)
+        }
+        Button {
+            useSmallValues.toggle()
+        } label: {
+            nativeCheckmarkLabel(language.text("使用小值", "Use small values"), checked: useSmallValues)
+        }
+        Button {
+            hideWhenMinimized.toggle()
+        } label: {
+            nativeCheckmarkLabel(language.text("最小化时隐藏", "Hide when minimized"), checked: hideWhenMinimized)
+        }
+        Divider()
+        Menu(language.text("语言", "Language")) {
+            ForEach(AppLanguage.allCases) { style in
+                Button {
+                    language = style
+                } label: {
+                    nativeCheckmarkLabel(style == .chinese ? "中文" : "English", checked: language == style)
+                }
+            }
+        }
+        Menu(language.text("菜单风格", "Menu style")) {
+            ForEach(MenuVisualStyle.allCases) { style in
+                Button {
+                    setMenuVisualStyle(style)
+                } label: {
+                    nativeCheckmarkLabel(style.title(in: language), checked: menuVisualStyle == style)
+                }
+            }
+        }
+        Menu(language.text("温度单位", "Temperature unit")) {
+            Button {
+                temperatureUnit = .celsius
+            } label: {
+                nativeCheckmarkLabel(language.text("摄氏度 °C", "Celsius °C"), checked: temperatureUnit == .celsius)
+            }
+            Button {
+                temperatureUnit = .fahrenheit
+            } label: {
+                nativeCheckmarkLabel(language.text("华氏度 °F", "Fahrenheit °F"), checked: temperatureUnit == .fahrenheit)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var nativeViewMenuContent: some View {
+        Button(language.text("立即刷新", "Refresh now")) {
+            monitor.refreshNow()
+        }
+        Menu(language.text("更新速度", "Update speed")) {
+            ForEach(RefreshSpeedOption.allCases) { option in
+                Button {
+                    monitor.setRefreshSpeed(option)
+                } label: {
+                    nativeCheckmarkLabel(option.title(in: language), checked: monitor.refreshSpeed == option)
+                }
+            }
+        }
+        Divider()
+        Button(language.text("全部展开", "Expand all")) {
+            collapsedSections.removeAll()
+        }
+        Button(language.text("全部折叠", "Collapse all")) {
+            collapsedSections = Set(monitor.processSections.map(\.kind))
+        }
+    }
 }
 
 enum MenuKind {
@@ -1066,6 +2392,7 @@ struct WindowChromeView: View {
                                     .fill(tab == selectedTab ? AppTheme.accentBlue : .clear)
                                     .frame(height: 2)
                             }
+                            .interactiveHitTarget()
                     }
                     .buttonStyle(.plain)
                 }
@@ -1097,12 +2424,21 @@ struct WindowChromeView: View {
 
     private func chromeButton(_ title: String, menu: MenuKind) -> some View {
         Button {
-            activeMenu = activeMenu == menu ? nil : menu
+            if activeMenu == menu {
+                activeMenu = nil
+            } else {
+                activeMenu = menu
+            }
         } label: {
             Text(title)
                 .frame(height: 22)
                 .padding(.horizontal, 2)
                 .background(activeMenu == menu ? AppTheme.menuHighlight(colorScheme) : Color.clear)
+                .interactiveHitTarget()
+                .onHover { hovering in
+                    guard hovering, activeMenu != nil, activeMenu != menu else { return }
+                    activeMenu = menu
+                }
         }
         .buttonStyle(.plain)
         .font(.system(size: 14))
@@ -1134,6 +2470,8 @@ struct FooterBarView: View {
     @Binding var compactMode: Bool
     let canEndTask: Bool
     let primaryActionTitle: String
+    let isToggleFocused: Bool
+    let isPrimaryActionFocused: Bool
     let onToggleCompact: () -> Void
     let onPrimaryAction: () -> Void
 
@@ -1152,6 +2490,13 @@ struct FooterBarView: View {
                     Text(compactMode ? language.text("详细信息(D)", "More details(D)") : language.text("简略信息(D)", "Fewer details(D)"))
                         .font(.system(size: 13))
                 }
+                .padding(.horizontal, 4)
+                .frame(height: 28)
+                .background(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .stroke(isToggleFocused ? AppTheme.accentBlue : .clear, lineWidth: 1.5)
+                )
+                .interactiveHitTarget()
             }
             .buttonStyle(.plain)
 
@@ -1161,6 +2506,7 @@ struct FooterBarView: View {
                 .buttonStyle(.plain)
                 .font(.system(size: 13))
                 .foregroundStyle(AppTheme.accentBlue)
+                .interactiveHitTarget()
 
             Spacer()
 
@@ -1176,8 +2522,9 @@ struct FooterBarView: View {
                 )
                 .overlay(
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .stroke(AppTheme.footerStroke(colorScheme), lineWidth: 1)
+                        .stroke(isPrimaryActionFocused ? AppTheme.accentBlue : AppTheme.footerStroke(colorScheme), lineWidth: isPrimaryActionFocused ? 1.5 : 1)
                 )
+                .interactiveHitTarget()
                 .disabled(!canEndTask)
         }
         .padding(.horizontal, 10)
@@ -1209,27 +2556,38 @@ struct CompactApplicationsView: View {
     @Binding var selectedPID: Int32?
 
     var body: some View {
-        ScrollView {
-            LazyVStack(spacing: 0) {
-                ForEach(rows) { row in
-                    HStack(spacing: 10) {
-                        ProcessIconView(icon: row.icon)
-                        Text(row.name)
-                            .font(.system(size: 14))
-                            .lineLimit(1)
-                        Spacer(minLength: 0)
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(rows) { row in
+                        HStack(spacing: 10) {
+                            ProcessIconView(icon: row.icon)
+                            Text(row.name)
+                                .font(.system(size: 14))
+                                .lineLimit(1)
+                            Spacer(minLength: 0)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .frame(height: 34)
+                        .padding(.horizontal, 18)
+                        .padding(.vertical, 4)
+                        .background(
+                            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                .fill(selectedPID == row.pid ? AppTheme.selectedRow(colorScheme) : Color.clear)
+                        )
+                        .contentShape(Rectangle())
+                        .id(row.pid)
+                        .onTapGesture {
+                            selectedPID = row.pid
+                        }
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .frame(height: 34)
-                    .padding(.horizontal, 18)
-                    .padding(.vertical, 4)
-                    .background(
-                        RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .fill(selectedPID == row.pid ? AppTheme.selectedRow(colorScheme) : Color.clear)
-                    )
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        selectedPID = row.pid
+                }
+            }
+            .onChange(of: selectedPID) { _, newValue in
+                guard let newValue else { return }
+                DispatchQueue.main.async {
+                    withAnimation(.easeInOut(duration: 0.12)) {
+                        proxy.scrollTo(newValue, anchor: .center)
                     }
                 }
             }
@@ -1247,6 +2605,8 @@ struct CompactModeContainer: View {
     let rows: [ProcessRowData]
     @Binding var selectedPID: Int32?
     let primaryActionTitle: String
+    let isMoreDetailsFocused: Bool
+    let isPrimaryActionFocused: Bool
     let onToggleCompact: () -> Void
     let onPrimaryAction: () -> Void
 
@@ -1258,6 +2618,8 @@ struct CompactModeContainer: View {
             CompactModeFooter(
                 canEndTask: selectedPID != nil,
                 primaryActionTitle: primaryActionTitle,
+                isMoreDetailsFocused: isMoreDetailsFocused,
+                isPrimaryActionFocused: isPrimaryActionFocused,
                 onToggleCompact: onToggleCompact,
                 onPrimaryAction: onPrimaryAction
             )
@@ -1291,6 +2653,8 @@ struct CompactModeFooter: View {
     @Environment(\.appLanguage) private var language
     let canEndTask: Bool
     let primaryActionTitle: String
+    let isMoreDetailsFocused: Bool
+    let isPrimaryActionFocused: Bool
     let onToggleCompact: () -> Void
     let onPrimaryAction: () -> Void
 
@@ -1309,6 +2673,13 @@ struct CompactModeFooter: View {
                     Text(language.text("详细信息(D)", "More details(D)"))
                         .font(.system(size: 13))
                 }
+                .padding(.horizontal, 4)
+                .frame(height: 28)
+                .background(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .stroke(isMoreDetailsFocused ? AppTheme.accentBlue : .clear, lineWidth: 1.5)
+                )
+                .interactiveHitTarget()
             }
             .buttonStyle(.plain)
 
@@ -1326,8 +2697,9 @@ struct CompactModeFooter: View {
                 )
                 .overlay(
                     RoundedRectangle(cornerRadius: 7, style: .continuous)
-                        .stroke(AppTheme.compactFooterStroke(colorScheme), lineWidth: 1)
+                        .stroke(isPrimaryActionFocused ? AppTheme.accentBlue : AppTheme.compactFooterStroke(colorScheme), lineWidth: isPrimaryActionFocused ? 1.5 : 1)
                 )
+                .interactiveHitTarget()
                 .disabled(!canEndTask)
         }
         .padding(.horizontal, 10)
@@ -1342,9 +2714,30 @@ struct CompactModeFooter: View {
 }
 
 struct WinMenuButtonStyle: ButtonStyle {
+    var isHighlighted = false
+
     func makeBody(configuration: Configuration) -> some View {
+        WinMenuButtonBody(configuration: configuration, isHighlighted: isHighlighted)
+    }
+}
+
+private struct WinMenuButtonBody: View {
+    @Environment(\.colorScheme) private var colorScheme
+    let configuration: ButtonStyle.Configuration
+    let isHighlighted: Bool
+    @State private var isHovering = false
+
+    var body: some View {
         configuration.label
-            .background(configuration.isPressed ? Color(red: 0.75, green: 0.88, blue: 1.0) : Color.clear)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                isHighlighted || isHovering || configuration.isPressed
+                    ? AppTheme.menuHighlight(colorScheme)
+                    : Color.clear
+            )
+            .onHover { hovering in
+                isHovering = hovering
+            }
     }
 }
 
@@ -1550,10 +2943,14 @@ final class NetworkDetailsPanelManager: ObservableObject {
 
 @MainActor
 final class AboutPanelManager: ObservableObject {
+    static let shared = AboutPanelManager()
+
     private var panel: NSPanel?
     private let panelSize = NSSize(width: 420, height: 320)
+    private var currentLanguage: AppLanguage = .defaultFromSystem()
 
     func show(language: AppLanguage) {
+        currentLanguage = language
         if panel == nil {
             let panel = NSPanel(
                 contentRect: NSRect(origin: .zero, size: panelSize),
@@ -1580,7 +2977,12 @@ final class AboutPanelManager: ObservableObject {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    func showCurrentLanguage() {
+        show(language: currentLanguage)
+    }
+
     func update(language: AppLanguage) {
+        currentLanguage = language
         guard let panel else { return }
         panel.title = language.text("关于 任务管理器", "About Task Manager")
         panel.contentView = NSHostingView(
@@ -1916,7 +3318,7 @@ struct MenuKeyHandlingView: NSViewRepresentable {
     let onAltF: () -> Void
     let onAltO: () -> Void
     let onAltV: () -> Void
-    let onEscape: () -> Void
+    let onNavigationCommand: (KeyboardNavigationCommand) -> Void
     let onControlChanged: (Bool) -> Void
     let onCommandChanged: (Bool) -> Void
 
@@ -1925,7 +3327,7 @@ struct MenuKeyHandlingView: NSViewRepresentable {
         view.onAltF = onAltF
         view.onAltO = onAltO
         view.onAltV = onAltV
-        view.onEscape = onEscape
+        view.onNavigationCommand = onNavigationCommand
         view.onControlChanged = onControlChanged
         view.onCommandChanged = onCommandChanged
         return view
@@ -1935,7 +3337,7 @@ struct MenuKeyHandlingView: NSViewRepresentable {
         nsView.onAltF = onAltF
         nsView.onAltO = onAltO
         nsView.onAltV = onAltV
-        nsView.onEscape = onEscape
+        nsView.onNavigationCommand = onNavigationCommand
         nsView.onControlChanged = onControlChanged
         nsView.onCommandChanged = onCommandChanged
         DispatchQueue.main.async {
@@ -1948,29 +3350,50 @@ final class KeyHandlingNSView: NSView {
     var onAltF: (() -> Void)?
     var onAltO: (() -> Void)?
     var onAltV: (() -> Void)?
-    var onEscape: (() -> Void)?
+    var onNavigationCommand: ((KeyboardNavigationCommand) -> Void)?
     var onControlChanged: ((Bool) -> Void)?
     var onCommandChanged: ((Bool) -> Void)?
 
     override var acceptsFirstResponder: Bool { true }
 
     override func keyDown(with event: NSEvent) {
-        if event.keyCode == 53 {
-            onEscape?()
+        let optionPressed = event.modifierFlags.contains(.option)
+        if optionPressed, let chars = event.charactersIgnoringModifiers?.lowercased() {
+            switch chars {
+            case "f": onAltF?()
+            case "o": onAltO?()
+            case "v": onAltV?()
+            default: super.keyDown(with: event)
+            }
             return
         }
 
-        let optionPressed = event.modifierFlags.contains(.option)
-        guard optionPressed, let chars = event.charactersIgnoringModifiers?.lowercased() else {
+        if event.modifierFlags.contains(.command) || event.modifierFlags.contains(.control) {
             super.keyDown(with: event)
             return
         }
 
-        switch chars {
-        case "f": onAltF?()
-        case "o": onAltO?()
-        case "v": onAltV?()
-        default: super.keyDown(with: event)
+        switch event.keyCode {
+        case 48:
+            onNavigationCommand?(event.modifierFlags.contains(.shift) ? .focusPrevious : .focusNext)
+        case 123:
+            onNavigationCommand?(.moveLeft)
+        case 124:
+            onNavigationCommand?(.moveRight)
+        case 125:
+            onNavigationCommand?(.moveDown)
+        case 126:
+            onNavigationCommand?(.moveUp)
+        case 36, 76:
+            onNavigationCommand?(.activatePrimary)
+        case 49:
+            onNavigationCommand?(.activateSecondary)
+        case 51:
+            onNavigationCommand?(.back)
+        case 53:
+            onNavigationCommand?(.cancel)
+        default:
+            super.keyDown(with: event)
         }
     }
 

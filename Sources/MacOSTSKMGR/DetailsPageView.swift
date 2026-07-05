@@ -66,7 +66,7 @@ struct DetailsPageView: View {
                 }
 
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 0) {
+                    LazyVStack(alignment: .leading, spacing: 0) {
                         ForEach(Array(sortedRows.enumerated()), id: \.element.id) { index, row in
                             HStack(spacing: 0) {
                                 nameRowCell(row, width: widths.name)

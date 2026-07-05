@@ -631,6 +631,8 @@ final class SystemMonitor: ObservableObject {
     private var previousDiskCounters: [String: (read: UInt64, write: UInt64, readOps: UInt64, writeOps: UInt64, readTimeNs: UInt64, writeTimeNs: UInt64)] = [:]
     private var previousNetworkCounters: [String: (in: UInt64, out: UInt64)] = [:]
     private var diskKindCache: [String: String] = [:]
+    private var detailedDiskMetadataCache: [String: DiskDetailMetadata] = [:]
+    private let iconCache = NSCache<NSString, NSImage>()
     private var aneIOReportSampler: ANEIOReportSampler?
     private var lastSampleDate = Date()
     private let hostPort = mach_host_self()
@@ -668,11 +670,22 @@ final class SystemMonitor: ObservableObject {
     private var lastGPUProbeDate: Date = .distantPast
     private var lastNPUUsageProbeDate: Date = .distantPast
     private var lastStartupRefreshDate: Date = .distantPast
+    private var isStopping = false
+    private var isDiskRefreshEnabled = false
+
+    private struct ProcessRefreshResult {
+        let rowsByPID: [Int32: ProcessRowData]
+        let snapshotsByPID: [Int32: ProcessSnapshot]
+        let processCount: Int
+        let threadCount: Int
+        let openFilesCount: Int
+    }
 
     init() {
         var pageSizeValue: vm_size_t = 0
         host_page_size(hostPort, &pageSizeValue)
         self.pageSize = UInt64(pageSizeValue)
+        iconCache.countLimit = 512
         bootstrapStaticInfo()
         rootWholeDiskID = MonitorProbe.rootWholeDiskIdentifierFromMountedRoot()
         configureANEIOReportIfNeeded()
@@ -680,9 +693,19 @@ final class SystemMonitor: ObservableObject {
 
     func start() {
         guard !hasStarted else { return }
+        isStopping = false
         hasStarted = true
         refresh()
         configureTimer()
+    }
+
+    func stop() {
+        isStopping = true
+        hasStarted = false
+        timer?.invalidate()
+        timer = nil
+        cancelSupplementalTasks()
+        iconCache.removeAllObjects()
     }
 
     private func configureANEIOReportIfNeeded() {
@@ -747,12 +770,9 @@ final class SystemMonitor: ObservableObject {
                 id: .npu(npu.id),
                 title: npu.title,
                 subtitle: npu.subtitle,
-                tertiary: DisplayFormat.watts(npu.powerWatts),
+                tertiary: DisplayFormat.percent(npu.activeTimePercent),
                 accent: Color(red: 0.96, green: 0.26, blue: 0.26),
-                sparkline: npu.historyPowerWatts.map {
-                    let ceiling = max(npu.peakPowerWatts, 0.5)
-                    return min($0 / ceiling * 100.0, 100.0)
-                },
+                sparkline: npu.historyActiveTime,
                 selectedFill: Color(red: 0.62, green: 0.82, blue: 1.0).opacity(0.45)
             )
         })
@@ -764,11 +784,12 @@ final class SystemMonitor: ObservableObject {
                 subtitle: gpu.subtitle,
                 tertiary: DisplayFormat.percent(gpu.utilizationPercent),
                 accent: Color(red: 0.68, green: 0.32, blue: 0.94),
-                sparkline: gpu.history3D,
+                sparkline: gpu.supportsEngineBreakdown ? gpu.history3D : gpu.historyOverall,
                 selectedFill: Color(red: 0.62, green: 0.82, blue: 1.0).opacity(0.45)
             )
         })
 
+        let fanless = thermal.maximumFanRPM == 0 || (thermal.currentFanRPM == 0 && thermal.peakFanRPM == 0)
         items.append(
             PerfSidebarItem(
                 id: .thermal,
@@ -776,7 +797,9 @@ final class SystemMonitor: ObservableObject {
                 subtitle: language.isChinese ? thermal.subtitle : thermal.subtitle.replacingOccurrences(of: "温度", with: "Temperature"),
                 tertiary: language.text(thermal.statusText, thermalStatusEnglish(from: thermal.statusText)),
                 accent: Color(red: 0.33, green: 0.73, blue: 0.25),
-                sparkline: thermal.historyFanRPM.map { min($0 / max(thermal.fanChartCeilingRPM, 1) * 100.0, 100.0) },
+                sparkline: fanless
+                    ? thermal.historyNetworkTemperatureCelsius.map { min($0 / max(thermal.networkTemperatureChartCeilingCelsius, 1) * 100.0, 100.0) }
+                    : thermal.historyFanRPM.map { min($0 / max(thermal.fanChartCeilingRPM, 1) * 100.0, 100.0) },
                 selectedFill: Color(red: 0.62, green: 0.82, blue: 1.0).opacity(0.45)
             )
         )
@@ -828,20 +851,22 @@ final class SystemMonitor: ObservableObject {
 
         refreshCPU(interval: interval)
         refreshMemory()
-        refreshDisks(interval: interval)
+        if isDiskRefreshEnabled {
+            refreshDisks(interval: interval)
+        }
         refreshNetworks(interval: interval)
-        refreshNPUs()
-        refreshGPUs()
+        refreshNPUs(ifNeededAt: now)
+        refreshGPUs(ifNeededAt: now)
         refreshThermal(interval: interval)
-        refreshProcesses(interval: interval)
+        let processRefresh = refreshProcesses(interval: interval)
         refreshAppHistory()
         refreshStartupItems()
-        refreshCurrentUserApps()
-        refreshDetailProcessRows()
+        refreshCurrentUserApps(processRowsByPID: processRefresh.rowsByPID)
+        refreshDetailProcessRows(rowsByPID: processRefresh.rowsByPID, snapshotsByPID: processRefresh.snapshotsByPID)
 
-        cpu.processCount = processSections.reduce(0) { $0 + $1.rows.count }
-        cpu.threadCount = processSections.flatMap(\.rows).reduce(0) { $0 + $1.threadCount }
-        cpu.openFilesCount = processSections.flatMap(\.rows).reduce(0) { $0 + $1.openFiles }
+        cpu.processCount = processRefresh.processCount
+        cpu.threadCount = processRefresh.threadCount
+        cpu.openFilesCount = processRefresh.openFilesCount
         cpu.uptimeText = DisplayFormat.uptime(ProcessInfo.processInfo.systemUptime)
         requestSupplementalRefreshes(ifNeededAt: now)
     }
@@ -863,6 +888,63 @@ final class SystemMonitor: ObservableObject {
     func setRefreshSpeed(_ speed: RefreshSpeedOption) {
         refreshSpeed = speed
         configureTimer()
+    }
+
+    func setDiskRefreshEnabled(_ enabled: Bool) {
+        guard isDiskRefreshEnabled != enabled else { return }
+        isDiskRefreshEnabled = enabled
+
+        guard enabled, hasStarted, !isTemporarilyPaused else { return }
+        let interval = max(Date().timeIntervalSince(lastSampleDate), 0.4)
+        refreshDisks(interval: interval)
+    }
+
+    func loadDetailedDiskMetadataIfNeeded(for selection: PerfSelection) {
+        guard case .disk(let diskID) = selection else { return }
+        loadDetailedDiskMetadataIfNeeded(forDiskID: diskID)
+    }
+
+    func hasDetailedDiskMetadata(forDiskID diskID: String) -> Bool {
+        detailedDiskMetadataCache[diskID] != nil || disks.first(where: { $0.id == diskID })?.hasDetailedMetadata == true
+    }
+
+    func loadDetailedDiskMetadataInBackground(forDiskID diskID: String) async -> Bool {
+        if hasDetailedDiskMetadata(forDiskID: diskID) {
+            return true
+        }
+
+        let rootWholeDiskID = self.rootWholeDiskID
+        let metadata = await Task.detached(priority: .utility) {
+            MonitorProbe.probeDetailedDiskMetadata(forDiskID: diskID, rootWholeDiskID: rootWholeDiskID)
+        }.value
+
+        guard let metadata else { return false }
+
+        detailedDiskMetadataCache[diskID] = metadata
+        diskKindCache[diskID] = metadata.kind
+
+        guard let index = disks.firstIndex(where: { $0.id == diskID }) else { return true }
+        disks[index].subtitle = metadata.subtitle
+        disks[index].kindLabel = metadata.kind
+        disks[index].availableBytes = metadata.availableBytes
+        disks[index].isSystemDisk = metadata.isSystemDisk
+        disks[index].hasDetailedMetadata = true
+        return true
+    }
+
+    func loadDetailedDiskMetadataIfNeeded(forDiskID diskID: String) {
+        guard detailedDiskMetadataCache[diskID] == nil else { return }
+        guard let metadata = probeDetailedDiskMetadata(forDiskID: diskID) else { return }
+
+        detailedDiskMetadataCache[diskID] = metadata
+        diskKindCache[diskID] = metadata.kind
+
+        guard let index = disks.firstIndex(where: { $0.id == diskID }) else { return }
+        disks[index].subtitle = metadata.subtitle
+        disks[index].kindLabel = metadata.kind
+        disks[index].availableBytes = metadata.availableBytes
+        disks[index].isSystemDisk = metadata.isSystemDisk
+        disks[index].hasDetailedMetadata = true
     }
 
     func setTemporarilyPaused(_ paused: Bool) {
@@ -900,33 +982,45 @@ final class SystemMonitor: ObservableObject {
     }
 
     private func requestSupplementalRefreshes(ifNeededAt now: Date) {
+        guard !isStopping else { return }
         scheduleStaticProbeIfNeeded()
         scheduleProcessNetworkProbe(ifNeededAt: now)
-        scheduleGPURefresh(ifNeededAt: now)
-        scheduleNPURefresh(ifNeededAt: now)
         scheduleStartupRefresh(ifNeededAt: now)
         scheduleServicesRefresh(ifNeededAt: now)
     }
 
+    private func cancelSupplementalTasks() {
+        staticProbeTask?.cancel()
+        processNetworkProbeTask?.cancel()
+        gpuProbeTask?.cancel()
+        npuInfoProbeTask?.cancel()
+        npuUsageProbeTask?.cancel()
+        startupProbeTask?.cancel()
+        servicesProbeTask?.cancel()
+    }
+
     private func scheduleStaticProbeIfNeeded() {
+        guard !isStopping else { return }
         guard staticProbeTask == nil else { return }
         guard hardwarePortMap.isEmpty || rootWholeDiskID == nil else { return }
 
         staticProbeTask = Task.detached(priority: .utility) {
             let snapshot = MonitorProbe.collectStaticProbeSnapshot()
             await MainActor.run {
+                self.staticProbeTask = nil
+                guard !self.isStopping else { return }
                 if let rootWholeDiskID = snapshot.rootWholeDiskID {
                     self.rootWholeDiskID = rootWholeDiskID
                 }
                 if !snapshot.hardwarePortMap.isEmpty {
                     self.hardwarePortMap = snapshot.hardwarePortMap
                 }
-                self.staticProbeTask = nil
             }
         }
     }
 
     private func scheduleProcessNetworkProbe(ifNeededAt now: Date, force: Bool = false) {
+        guard !isStopping else { return }
         guard processNetworkProbeTask == nil else { return }
         let minimumInterval = max(refreshSpeed.interval ?? 1.0, 0.5)
         guard force || processNetworkTotals.isEmpty || now.timeIntervalSince(lastProcessNetworkProbeDate) >= minimumInterval else { return }
@@ -936,30 +1030,35 @@ final class SystemMonitor: ObservableObject {
             let totals = MonitorProbe.collectProcessNetworkSnapshot(interfaceFilter: nil)
             let meteredTotals = MonitorProbe.collectProcessNetworkSnapshot(interfaceFilter: "expensive")
             await MainActor.run {
+                self.processNetworkProbeTask = nil
+                guard !self.isStopping else { return }
                 self.processNetworkTotals = totals
                 self.meteredProcessNetworkTotals = meteredTotals
-                self.processNetworkProbeTask = nil
             }
         }
     }
 
     private func scheduleGPURefresh(ifNeededAt now: Date, force: Bool = false) {
+        guard !isStopping else { return }
         guard gpuProbeTask == nil else { return }
         guard force || gpus.isEmpty || now.timeIntervalSince(lastGPUProbeDate) >= 2 else { return }
 
         let previousGPUs = gpus
         let language = language
+        let cpuArchitecture = cpuArchitecture
         lastGPUProbeDate = now
         gpuProbeTask = Task.detached(priority: .utility) {
-            let nextGPUs = MonitorProbe.collectGPUStates(previous: previousGPUs, language: language)
+            let nextGPUs = MonitorProbe.collectGPUStates(previous: previousGPUs, language: language, cpuArchitecture: cpuArchitecture)
             await MainActor.run {
-                self.gpus = nextGPUs
                 self.gpuProbeTask = nil
+                guard !self.isStopping else { return }
+                self.gpus = nextGPUs
             }
         }
     }
 
     private func scheduleNPURefresh(ifNeededAt now: Date, force: Bool = false) {
+        guard !isStopping else { return }
         guard cpuArchitecture != .intelLike else {
             npus = []
             return
@@ -971,8 +1070,9 @@ final class SystemMonitor: ObservableObject {
             npuInfoProbeTask = Task.detached(priority: .utility) {
                 let info = MonitorProbe.collectANEDeviceInfo(cpuArchitecture: architecture)
                 await MainActor.run {
-                    self.aneInfoCache = info
                     self.npuInfoProbeTask = nil
+                    guard !self.isStopping else { return }
+                    self.aneInfoCache = info
                 }
             }
             return
@@ -1002,13 +1102,15 @@ final class SystemMonitor: ObservableObject {
                 dataMovementBytesPerSecond: aneMetrics.dataMovementBytesPerSecond
             )
             await MainActor.run {
-                self.npus = nextNPU.map { [$0] } ?? []
                 self.npuUsageProbeTask = nil
+                guard !self.isStopping else { return }
+                self.npus = nextNPU.map { [$0] } ?? []
             }
         }
     }
 
     private func scheduleStartupRefresh(ifNeededAt now: Date, force: Bool = false) {
+        guard !isStopping else { return }
         guard startupProbeTask == nil else { return }
         guard force || startupRows.isEmpty || now.timeIntervalSince(lastStartupRefreshDate) >= 30 else { return }
 
@@ -1017,6 +1119,8 @@ final class SystemMonitor: ObservableObject {
         startupProbeTask = Task.detached(priority: .utility) {
             let snapshot = MonitorProbe.collectStartupRows()
             await MainActor.run {
+                self.startupProbeTask = nil
+                guard !self.isStopping else { return }
                 self.disabledLaunchdByGroup = snapshot.disabledLaunchdByGroup
                 self.startupRows = snapshot.rows.map { row in
                     StartupItemRowData(
@@ -1028,7 +1132,6 @@ final class SystemMonitor: ObservableObject {
                         startupImpact: row.startupImpact
                     )
                 }
-                self.startupProbeTask = nil
                 if self.language != language {
                     self.startupRows = self.startupRows.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
                 }
@@ -1037,6 +1140,7 @@ final class SystemMonitor: ObservableObject {
     }
 
     private func scheduleServicesRefresh(ifNeededAt now: Date, force: Bool = false) {
+        guard !isStopping else { return }
         guard servicesProbeTask == nil else { return }
         guard force || serviceRows.isEmpty || now.timeIntervalSince(lastServicesRefreshDate) >= 5 else { return }
 
@@ -1044,6 +1148,8 @@ final class SystemMonitor: ObservableObject {
         servicesProbeTask = Task.detached(priority: .utility) {
             let snapshot = MonitorProbe.collectServiceRows(uid: getuid())
             await MainActor.run {
+                self.servicesProbeTask = nil
+                guard !self.isStopping else { return }
                 self.serviceRows = snapshot.map { row in
                     ServiceRowData(
                         id: row.id,
@@ -1056,7 +1162,6 @@ final class SystemMonitor: ObservableObject {
                         label: row.label
                     )
                 }
-                self.servicesProbeTask = nil
             }
         }
     }
@@ -1169,11 +1274,13 @@ final class SystemMonitor: ObservableObject {
         )
     }
 
-    private func refreshProcesses(interval: TimeInterval) {
+    private func refreshProcesses(interval: TimeInterval) -> ProcessRefreshResult {
         let pids = listPIDs()
         let logicalCores = max(cpu.logicalCores, 1)
         var rowsByPID: [Int32: ProcessRowData] = [:]
         rowsByPID.reserveCapacity(pids.count)
+        var snapshotsByPID: [Int32: ProcessSnapshot] = [:]
+        snapshotsByPID.reserveCapacity(pids.count)
 
         var newCPUCache: [Int32: UInt64] = [:]
         var newRUsageCache: [Int32: (UInt64, UInt64)] = [:]
@@ -1183,9 +1290,14 @@ final class SystemMonitor: ObservableObject {
         var nextPowerTrendWatts: [Int32: Double] = [:]
         let processNetworkTotals = self.processNetworkTotals
         var newNetworkCache: [Int32: UInt64] = [:]
+        var totalThreadCount = 0
+        var totalOpenFilesCount = 0
 
         for pid in pids where pid > 0 {
             guard let info = processInfo(pid: pid) else { continue }
+            snapshotsByPID[pid] = info
+            totalThreadCount += info.threadCount
+            totalOpenFilesCount += info.openFiles
 
             let totalCPU = info.totalCPUTime
             let previousCPU = previousProcessCPUTime[pid] ?? totalCPU
@@ -1317,70 +1429,16 @@ final class SystemMonitor: ObservableObject {
             .sorted(by: processRowSort)
 
         processSections = [
-            ProcessSectionData(title: language.text("应用", "Apps") + " (\(appRows.count))", rows: appRows),
-            ProcessSectionData(title: language.text("后台进程", "Background") + " (\(background.count))", rows: Array(background.prefix(160)))
+            ProcessSectionData(kind: .apps, rows: appRows),
+            ProcessSectionData(kind: .background, rows: Array(background.prefix(160)))
         ]
-    }
 
-    private func processRowData(pid: Int32) -> ProcessRowData? {
-        guard let info = processInfo(pid: pid) else { return nil }
-        let totalCPU = info.totalCPUTime
-        let previousCPU = previousProcessCPUTime[pid] ?? totalCPU
-        let cpuDelta = totalCPU >= previousCPU ? totalCPU - previousCPU : 0
-        let logicalCores = max(cpu.logicalCores, 1)
-        var cpuPercent = min(max((Double(cpuDelta) / max(refreshSpeed.interval ?? 1.0, 0.5) / 1_000_000_000.0) / Double(logicalCores) * 100, 0), 999)
-        if cpuPercent > 0 && cpuPercent < 0.1 {
-            cpuPercent = 0.1
-        }
-
-        let sampleInterval = max(refreshSpeed.interval ?? 1.0, 0.5)
-
-        let currentDisk: (read: UInt64, write: UInt64) = (info.diskReadBytes, info.diskWriteBytes)
-        let previousDisk = previousProcessRUsage[pid] ?? currentDisk
-        let diskDelta = (currentDisk.read >= previousDisk.read ? currentDisk.read - previousDisk.read : 0) + (currentDisk.write >= previousDisk.write ? currentDisk.write - previousDisk.write : 0)
-        let diskPerSecond = UInt64(Double(diskDelta) / sampleInterval)
-
-        let energyNanojoules = info.energyNanojoules
-        let previousEnergy = previousProcessEnergyNanojoules[pid] ?? energyNanojoules
-        let energyDelta = energyNanojoules >= previousEnergy ? energyNanojoules - previousEnergy : 0
-        let powerUsageWatts = Double(energyDelta) / 1_000_000_000.0 / sampleInterval
-
-        let packageWakeups = info.packageIdleWakeups
-        let previousPackageWakeups = previousProcessPackageIdleWakeups[pid] ?? packageWakeups
-        let packageWakeupDelta = packageWakeups >= previousPackageWakeups ? packageWakeups - previousPackageWakeups : 0
-
-        let interruptWakeups = info.interruptWakeups
-        let previousInterruptWakeups = previousProcessInterruptWakeups[pid] ?? interruptWakeups
-        let interruptWakeupDelta = interruptWakeups >= previousInterruptWakeups ? interruptWakeups - previousInterruptWakeups : 0
-        let totalWakeupsPerSecond = Double(packageWakeupDelta + interruptWakeupDelta) / sampleInterval
-        let powerTrendWatts = processPowerTrendWatts[pid] ?? powerUsageWatts
-
-        let networkTotals = processNetworkTotals
-        let totalNetworkBytes = networkTotals[pid] ?? 0
-        let previousNetworkBytes = previousProcessNetworkTotals[pid] ?? totalNetworkBytes
-        let networkDelta = totalNetworkBytes >= previousNetworkBytes ? (totalNetworkBytes - previousNetworkBytes) : UInt64(0)
-        let networkPerSecond = UInt64(Double(networkDelta) / sampleInterval)
-
-        return ProcessRowData(
-            pid: pid,
-            name: info.displayName,
-            icon: info.icon,
-            path: info.path,
-            isApp: info.isApplication,
-            isParent: false,
-            parentPID: nil,
-            childCount: 0,
-            cpuPercent: cpuPercent,
-            memoryBytes: info.residentSize,
-            diskBytesPerSecond: diskPerSecond,
-            networkBytesPerSecond: networkPerSecond,
-            networkText: networkPerSecond == 0 ? "0 Mbps" : DisplayFormat.networkRate(networkPerSecond),
-            powerUsageWatts: powerUsageWatts,
-            powerTrendWatts: powerTrendWatts,
-            powerImpact: DisplayFormat.impactLabel(powerUsageWatts: powerUsageWatts, wakeupsPerSecond: totalWakeupsPerSecond, language: language),
-            trend: DisplayFormat.impactLabel(powerUsageWatts: powerTrendWatts, wakeupsPerSecond: totalWakeupsPerSecond * 0.7, language: language),
-            threadCount: info.threadCount,
-            openFiles: info.openFiles
+        return ProcessRefreshResult(
+            rowsByPID: rowsByPID,
+            snapshotsByPID: snapshotsByPID,
+            processCount: snapshotsByPID.count,
+            threadCount: totalThreadCount,
+            openFilesCount: totalOpenFilesCount
         )
     }
 
@@ -1415,10 +1473,10 @@ final class SystemMonitor: ObservableObject {
         appHistoryRows = historyRows
     }
 
-    private func refreshCurrentUserApps() {
+    private func refreshCurrentUserApps(processRowsByPID rowsByPID: [Int32: ProcessRowData]) {
         let rows: [ProcessRowData] = currentUserRunningApplications().compactMap { app -> ProcessRowData? in
             let pid = app.processIdentifier
-            guard let row = processRowData(pid: pid) else { return nil }
+            guard let row = rowsByPID[pid] else { return nil }
             return ProcessRowData(
                 pid: row.pid,
                 name: app.localizedName ?? row.name,
@@ -1445,16 +1503,14 @@ final class SystemMonitor: ObservableObject {
         currentUserSection = UserPageSectionData(userName: NSFullUserName(), rows: rows)
     }
 
-    private func refreshDetailProcessRows() {
-        let pids = listPIDs()
-        detailProcessRows = pids.compactMap { pid in
-            guard let info = processInfo(pid: pid) else { return nil }
-            let cpu = processCPUDisplayPercent(pid: pid, totalCPUTime: info.totalCPUTime)
+    private func refreshDetailProcessRows(rowsByPID: [Int32: ProcessRowData], snapshotsByPID: [Int32: ProcessSnapshot]) {
+        detailProcessRows = snapshotsByPID.values.map { info in
+            let cpu = rowsByPID[info.pid]?.cpuPercent ?? processCPUDisplayPercent(pid: info.pid, totalCPUTime: info.totalCPUTime)
             return DetailProcessRowData(
-                id: pid,
+                id: info.pid,
                 name: info.displayName,
                 icon: info.icon,
-                pid: pid,
+                pid: info.pid,
                 status: processStatusText(info.bsdStatus),
                 userName: userName(for: info.uid),
                 cpuPercent: cpu,
@@ -1645,6 +1701,7 @@ final class SystemMonitor: ObservableObject {
                 capacityBytes: item.capacityBytes,
                 availableBytes: item.availableBytes,
                 isSystemDisk: item.isSystemDisk,
+                hasDetailedMetadata: item.hasDetailedMetadata,
                 activityPercent: activityPercent,
                 responseTimeMs: responseMs,
                 readBytesPerSecond: readPerSec,
@@ -1662,7 +1719,6 @@ final class SystemMonitor: ObservableObject {
     }
 
     private func refreshThermal(interval: TimeInterval) {
-        guard Date().timeIntervalSince(lastThermalRefreshDate) >= 2 else { return }
         lastThermalRefreshDate = Date()
         let snapshot = collectThermalSnapshot()
         let fanRPM = snapshot.currentFanRPM
@@ -1864,13 +1920,26 @@ final class SystemMonitor: ObservableObject {
             ],
             rightPairs: [
                 .init(label: language.text("容量", "Capacity"), value: DisplayFormat.decimalBytes(disk.capacityBytes)),
-                .init(label: language.text("可用", "Available"), value: DisplayFormat.decimalBytes(disk.availableBytes)),
+                .init(label: language.text("可用", "Available"), value: diskAvailableText(disk)),
                 .init(label: language.text("系统磁盘", "System disk"), value: disk.isSystemDisk ? language.text("是", "Yes") : language.text("否", "No")),
                 .init(label: language.text("类型", "Type"), value: diskKind),
-                .init(label: language.text("卷标", "Label"), value: disk.subtitle)
+                .init(label: language.text("卷标", "Label"), value: diskLabelText(disk))
             ],
             memoryComposition: false
         )
+    }
+
+    private func diskAvailableText(_ disk: DiskState) -> String {
+        guard disk.hasDetailedMetadata else { return "--" }
+        if disk.availableBytes == 0 && disk.subtitle.isEmpty {
+            return "--"
+        }
+        return DisplayFormat.decimalBytes(disk.availableBytes)
+    }
+
+    private func diskLabelText(_ disk: DiskState) -> String {
+        guard disk.hasDetailedMetadata, !disk.subtitle.isEmpty else { return "--" }
+        return disk.subtitle
     }
 
     private func networkDetail(_ network: NetworkState) -> PerformanceDetailViewData {
@@ -1994,13 +2063,33 @@ final class SystemMonitor: ObservableObject {
         var rightPairs: [InfoPair] = [
             .init(label: language.text("GPU 个数", "GPU count"), value: "\(gpu.gpuCount)"),
             .init(label: language.text("GPU 类型", "GPU type"), value: gpu.gpuType),
-            .init(label: language.text("GPU 核心", "GPU cores"), value: "\(gpu.coreCount)"),
-            .init(label: language.text("3D 引擎", "3D engine"), value: DisplayFormat.percent(gpu.rendererUtilizationPercent)),
-            .init(label: "Tiler", value: DisplayFormat.percent(gpu.tilerUtilizationPercent)),
-            .init(label: language.text("Metal 版本", "Metal version"), value: gpu.metalVersion)
+            .init(label: language.text("GPU 核心", "GPU cores"), value: "\(gpu.coreCount)")
         ]
+        if gpu.supportsEngineBreakdown {
+            rightPairs.append(.init(label: language.text("3D 引擎", "3D engine"), value: DisplayFormat.percent(gpu.rendererUtilizationPercent)))
+            rightPairs.append(.init(label: "Tiler", value: DisplayFormat.percent(gpu.tilerUtilizationPercent)))
+        }
+        rightPairs.append(.init(label: language.text("Metal 版本", "Metal version"), value: gpu.metalVersion))
         if let openGLVersion = gpu.openGLVersion, !openGLVersion.isEmpty {
             rightPairs.append(.init(label: language.text("OpenGL 版本", "OpenGL version"), value: openGLVersion))
+        }
+
+        let usesDedicatedMemory = gpu.dedicatedMemoryTotalBytes > 0
+        let gpuMemoryLabel = usesDedicatedMemory
+            ? language.text("专用 GPU 内存", "Dedicated GPU memory")
+            : language.text("共享 GPU 内存", "Shared GPU memory")
+        let gpuMemoryUsed = usesDedicatedMemory ? gpu.dedicatedMemoryUsedBytes : gpu.sharedMemoryUsedBytes
+        let gpuMemoryTotal = max(usesDedicatedMemory ? gpu.dedicatedMemoryTotalBytes : gpu.sharedMemoryAllocatedBytes, 1)
+        var leftMetrics: [DetailMetric] = [
+            .init(label: language.text("利用率", "Utilization"), value: DisplayFormat.percent(gpu.utilizationPercent), prominent: true),
+            .init(label: gpuMemoryLabel, value: "\(DisplayFormat.memory(gpuMemoryUsed))/\(DisplayFormat.memory(gpuMemoryTotal))", prominent: true),
+            .init(label: language.text("GPU 内存", "GPU memory"), value: DisplayFormat.memory(gpuMemoryUsed))
+        ]
+        if usesDedicatedMemory, gpu.sharedMemoryAllocatedBytes > 0 {
+            leftMetrics.append(.init(
+                label: language.text("共享 GPU 内存", "Shared GPU memory"),
+                value: "\(DisplayFormat.memory(gpu.sharedMemoryUsedBytes))/\(DisplayFormat.memory(gpu.sharedMemoryAllocatedBytes))"
+            ))
         }
 
         return PerformanceDetailViewData(
@@ -2013,20 +2102,16 @@ final class SystemMonitor: ObservableObject {
             chartSets: [gpu.historyOverall, gpu.history3D, gpu.historyTiler],
             lowerChart: gpu.memoryHistory,
             lowerChartValueCeiling: 100,
-            lowerChartCeiling: DisplayFormat.memory(max(gpu.sharedMemoryAllocatedBytes, 1)),
-            lowerLabel: language.text("共享 GPU 内存", "Shared GPU memory"),
-            leftMetrics: [
-                .init(label: language.text("利用率", "Utilization"), value: DisplayFormat.percent(gpu.utilizationPercent), prominent: true),
-                .init(label: language.text("共享 GPU 内存", "Shared GPU memory"), value: "\(DisplayFormat.memory(gpu.sharedMemoryUsedBytes))/\(DisplayFormat.memory(max(gpu.sharedMemoryAllocatedBytes, 1)))", prominent: true),
-                .init(label: language.text("GPU 内存", "GPU memory"), value: DisplayFormat.memory(gpu.sharedMemoryUsedBytes))
-            ],
+            lowerChartCeiling: DisplayFormat.memory(gpuMemoryTotal),
+            lowerLabel: gpuMemoryLabel,
+            leftMetrics: leftMetrics,
             rightPairs: rightPairs,
             memoryComposition: false
         )
     }
 
-    private func refreshNPUs() {
-        scheduleNPURefresh(ifNeededAt: Date())
+    private func refreshNPUs(ifNeededAt now: Date) {
+        scheduleNPURefresh(ifNeededAt: now, force: true)
     }
 
     private func cpuGridHistories() -> [[Double]] {
@@ -2121,7 +2206,15 @@ extension SystemMonitor {
         let capacityBytes: UInt64
         let availableBytes: UInt64
         let isSystemDisk: Bool
+        let hasDetailedMetadata: Bool
         let counters: (read: UInt64, write: UInt64, readOps: UInt64, writeOps: UInt64, readTimeNs: UInt64, writeTimeNs: UInt64)
+    }
+
+    struct DiskDetailMetadata {
+        let subtitle: String
+        let kind: String
+        let availableBytes: UInt64
+        let isSystemDisk: Bool
     }
 
     struct LaunchdRuntimeEntry {
@@ -2258,17 +2351,7 @@ extension SystemMonitor {
     }
 
     func startupItemIcon(fromProgramPath program: String) -> NSImage? {
-        guard !program.isEmpty else { return nil }
-        if program.hasSuffix(".app") {
-            return NSWorkspace.shared.icon(forFile: program)
-        }
-        let nsPath = program as NSString
-        let range = nsPath.range(of: ".app/")
-        if range.location != NSNotFound, let swiftRange = Range(range, in: program) {
-            let appPath = String(program[..<swiftRange.upperBound]).dropLast()
-            return NSWorkspace.shared.icon(forFile: String(appPath))
-        }
-        return NSWorkspace.shared.icon(forFile: program)
+        iconForResolvedPath(program)
     }
 
     func launchdRuntimeEntries(uid: uid_t) -> [LaunchdRuntimeEntry] {
@@ -2915,17 +2998,32 @@ extension SystemMonitor {
     }
 
     func iconForProcess(path: String) -> NSImage? {
+        iconForResolvedPath(path)
+    }
+
+    private func iconForResolvedPath(_ path: String) -> NSImage? {
+        guard let iconPath = resolvedIconPath(from: path) else { return nil }
+        let key = iconPath as NSString
+        if let cached = iconCache.object(forKey: key) {
+            return cached
+        }
+        let icon = NSWorkspace.shared.icon(forFile: iconPath)
+        iconCache.setObject(icon, forKey: key)
+        return icon
+    }
+
+    private func resolvedIconPath(from path: String) -> String? {
         guard !path.isEmpty else { return nil }
         if path.hasSuffix(".app") {
-            return NSWorkspace.shared.icon(forFile: path)
+            return path
         }
         let nsPath = path as NSString
         let range = nsPath.range(of: ".app/")
         if range.location != NSNotFound, let swiftRange = Range(range, in: path) {
             let appPath = String(path[..<swiftRange.upperBound]).dropLast()
-            return NSWorkspace.shared.icon(forFile: String(appPath))
+            return String(appPath)
         }
-        return NSWorkspace.shared.icon(forFile: path)
+        return path
     }
 
     func networkInterfaces() -> [InterfaceSnapshot] {
@@ -3168,8 +3266,12 @@ extension SystemMonitor {
         return cpu.modelName
     }
 
+    private func refreshGPUs(ifNeededAt now: Date) {
+        scheduleGPURefresh(ifNeededAt: now, force: true)
+    }
+
     func refreshGPUs() {
-        scheduleGPURefresh(ifNeededAt: Date())
+        refreshGPUs(ifNeededAt: Date())
     }
 
     func metalLabel(from raw: String) -> String {
@@ -3192,7 +3294,6 @@ extension SystemMonitor {
         }
         defer { IOObjectRelease(iterator) }
 
-        let mountInfo = mountedDiskInfoByWholeDisk()
         var result: [DiskMeta] = []
         var index = 0
 
@@ -3215,9 +3316,9 @@ extension SystemMonitor {
 
             let size = (mediaProps["Size"] as? NSNumber)?.uint64Value ?? 0
             let model = ioRegistryName(media).isEmpty ? deviceIdentifier : ioRegistryName(media)
-            let kind = diskKindCache[deviceIdentifier] ?? {
-                let resolved = resolveDiskKind(
-                    deviceIdentifier: deviceIdentifier,
+            let detailedMetadata = detailedDiskMetadataCache[deviceIdentifier]
+            let kind = detailedMetadata?.kind ?? {
+                let resolved = diskKindCache[deviceIdentifier] ?? lightweightDiskKind(
                     mediaProps: mediaProps,
                     model: model,
                     service: service,
@@ -3226,8 +3327,9 @@ extension SystemMonitor {
                 diskKindCache[deviceIdentifier] = resolved
                 return resolved
             }()
-            let label = mountInfo[deviceIdentifier]?.label ?? deviceIdentifier
-            let available = mountInfo[deviceIdentifier]?.availableBytes ?? size
+            let label = detailedMetadata?.subtitle ?? ""
+            let available = detailedMetadata?.availableBytes ?? 0
+            let isSystemDisk = detailedMetadata?.isSystemDisk ?? (deviceIdentifier == rootWholeDiskID)
 
             result.append(DiskMeta(
                 id: deviceIdentifier,
@@ -3237,7 +3339,8 @@ extension SystemMonitor {
                 model: model,
                 capacityBytes: size,
                 availableBytes: available,
-                isSystemDisk: deviceIdentifier == rootWholeDiskID,
+                isSystemDisk: isSystemDisk,
+                hasDetailedMetadata: detailedMetadata != nil,
                 counters: (
                     (stats["Bytes (Read)"] as? NSNumber)?.uint64Value ?? 0,
                     (stats["Bytes (Write)"] as? NSNumber)?.uint64Value ?? 0,
@@ -3287,11 +3390,41 @@ extension SystemMonitor {
         if removable {
             return "Removable"
         }
+
+        if isLikelyExternalDisk(registryHints: registryHints) {
+            return "Removable"
+        }
+
         return normalizedInternalDiskInterface(
             busProtocol: "",
             deviceTreePath: "",
             solidState: model.localizedCaseInsensitiveContains("SSD"),
-            registryHints: registryHints
+            registryHints: registryHints,
+            fallbackLabel: "Unknown"
+        )
+    }
+
+    private func lightweightDiskKind(
+        mediaProps: [String: Any],
+        model: String,
+        service: io_registry_entry_t,
+        media: io_registry_entry_t
+    ) -> String {
+        let removable = (mediaProps["Removable"] as? Bool) ?? false || ((mediaProps["Ejectable"] as? Bool) ?? false)
+        if removable {
+            return "Removable"
+        }
+
+        let registryHints = registryHintStrings(for: service) + registryHintStrings(for: media)
+        if isLikelyExternalDisk(registryHints: registryHints) {
+            return "Removable"
+        }
+        return normalizedInternalDiskInterface(
+            busProtocol: "",
+            deviceTreePath: "",
+            solidState: model.localizedCaseInsensitiveContains("SSD"),
+            registryHints: registryHints,
+            fallbackLabel: "Unknown"
         )
     }
 
@@ -3302,11 +3435,55 @@ extension SystemMonitor {
         return (try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)) as? [String: Any]
     }
 
+    private func probeDetailedDiskMetadata(forDiskID diskID: String) -> DiskDetailMetadata? {
+        var iterator: io_iterator_t = 0
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOBlockStorageDriver"), &iterator) == KERN_SUCCESS else {
+            return nil
+        }
+        defer { IOObjectRelease(iterator) }
+
+        let mountInfo = mountedDiskInfoByWholeDisk()
+
+        while true {
+            let service = IOIteratorNext(iterator)
+            if service == 0 { break }
+            defer { IOObjectRelease(service) }
+
+            guard let media = wholeMediaChild(of: service) else { continue }
+            defer { IOObjectRelease(media) }
+
+            let mediaProps = registryProperties(media)
+            let deviceIdentifier = mediaProps["BSD Name"] as? String ?? ""
+            guard deviceIdentifier == diskID else { continue }
+
+            let model = ioRegistryName(media).isEmpty ? deviceIdentifier : ioRegistryName(media)
+            let kind = resolveDiskKind(
+                deviceIdentifier: deviceIdentifier,
+                mediaProps: mediaProps,
+                model: model,
+                service: service,
+                media: media
+            )
+            let label = mountInfo[deviceIdentifier]?.label ?? ""
+            let available = mountInfo[deviceIdentifier]?.availableBytes ?? 0
+
+            return DiskDetailMetadata(
+                subtitle: label,
+                kind: kind,
+                availableBytes: available,
+                isSystemDisk: deviceIdentifier == rootWholeDiskID
+            )
+        }
+
+        return nil
+    }
+
     private func normalizedInternalDiskInterface(
         busProtocol: String,
         deviceTreePath: String,
         solidState: Bool,
-        registryHints: [String]
+        registryHints: [String],
+        fallbackLabel: String = "Internal"
     ) -> String {
         let lowerBus = busProtocol.lowercased()
         let lowerTreePath = deviceTreePath.lowercased()
@@ -3337,7 +3514,25 @@ extension SystemMonitor {
         if combinedHints.contains("ide") {
             return "IDE"
         }
-        return busProtocol.isEmpty ? "Internal" : busProtocol
+        return busProtocol.isEmpty ? fallbackLabel : busProtocol
+    }
+
+    private func isLikelyExternalDisk(registryHints: [String]) -> Bool {
+        let combinedHints = registryHints.joined(separator: " ").lowercased()
+        let externalMarkers = [
+            "external",
+            "usb",
+            "thunderbolt",
+            "firewire",
+            "sdxc",
+            "sd card",
+            "card reader",
+            "cardreader",
+            "mass storage",
+            "removable",
+            "portable"
+        ]
+        return externalMarkers.contains { combinedHints.contains($0) }
     }
 
     private func registryHintStrings(for entry: io_registry_entry_t, maxDepth: Int = 8) -> [String] {
@@ -3596,12 +3791,33 @@ extension SystemMonitor {
     }
 
     func resolveCPUArchitecture() -> CPUArchitecture {
-        if let translated = sysctlInt("sysctl.proc_translated"), translated == 1 {
-            return .intelLike
+        if let brand = sysctlString("machdep.cpu.brand_string")?.lowercased(), !brand.isEmpty {
+            if brand.contains("intel") || brand.contains("xeon") {
+                return .intelLike
+            }
+            if brand.contains("apple")
+                || brand.contains("m1")
+                || brand.contains("m2")
+                || brand.contains("m3")
+                || brand.contains("m4")
+                || brand.contains("m5")
+            {
+                return .appleSilicon
+            }
+        }
+
+        if let translated = sysctlInt("sysctl.proc_translated"), translated == 1,
+           let arm64 = sysctlInt("hw.optional.arm64"), arm64 == 1
+        {
+            return .appleSilicon
         }
 
         if let arm64 = sysctlInt("hw.optional.arm64"), arm64 == 1 {
             return .appleSilicon
+        }
+
+        if let translated = sysctlInt("sysctl.proc_translated"), translated == 1 {
+            return .intelLike
         }
 
         if let cpuType = sysctlInt("hw.cputype") {
@@ -3619,19 +3835,6 @@ extension SystemMonitor {
             if machine.contains("x86") || machine.contains("i386") {
                 return .intelLike
             }
-        }
-
-        if let processArch = ProcessInfo.processInfo.processorCount as Int?, processArch > 0,
-           let translated = sysctlInt("sysctl.proc_translated"), translated == 0,
-           let brand = sysctlString("machdep.cpu.brand_string"),
-           !brand.isEmpty {
-            if brand.contains("Intel") || brand.contains("Xeon") {
-                return .intelLike
-            }
-        }
-
-        if let brand = sysctlString("machdep.cpu.brand_string"), brand.contains("Apple") || brand.contains("M1") || brand.contains("M2") || brand.contains("M3") || brand.contains("M4") || brand.contains("M5") {
-            return .appleSilicon
         }
 
         return .unknown
@@ -3821,10 +4024,11 @@ extension Process {
     static func runAndCapture(_ launchPath: String, _ arguments: [String]) throws -> Data {
         let process = Process()
         let pipe = Pipe()
+        let errorPipe = Pipe()
         process.executableURL = URL(fileURLWithPath: launchPath)
         process.arguments = arguments
         process.standardOutput = pipe
-        process.standardError = Pipe()
+        process.standardError = errorPipe
         try process.run()
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
@@ -3861,6 +4065,52 @@ private enum MonitorProbe {
         let status: String
         let group: String
         let label: String
+    }
+
+    static func probeDetailedDiskMetadata(
+        forDiskID diskID: String,
+        rootWholeDiskID: String?
+    ) -> SystemMonitor.DiskDetailMetadata? {
+        var iterator: io_iterator_t = 0
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOBlockStorageDriver"), &iterator) == KERN_SUCCESS else {
+            return nil
+        }
+        defer { IOObjectRelease(iterator) }
+
+        let mountInfo = mountedDiskInfoByWholeDisk()
+
+        while true {
+            let service = IOIteratorNext(iterator)
+            if service == 0 { break }
+            defer { IOObjectRelease(service) }
+
+            guard let media = wholeMediaChild(of: service) else { continue }
+            defer { IOObjectRelease(media) }
+
+            let mediaProps = registryProperties(media)
+            let deviceIdentifier = mediaProps["BSD Name"] as? String ?? ""
+            guard deviceIdentifier == diskID else { continue }
+
+            let model = ioRegistryName(media).isEmpty ? deviceIdentifier : ioRegistryName(media)
+            let kind = resolveDiskKind(
+                deviceIdentifier: deviceIdentifier,
+                mediaProps: mediaProps,
+                model: model,
+                service: service,
+                media: media
+            )
+            let label = mountInfo[deviceIdentifier]?.label ?? ""
+            let available = mountInfo[deviceIdentifier]?.availableBytes ?? 0
+
+            return SystemMonitor.DiskDetailMetadata(
+                subtitle: label,
+                kind: kind,
+                availableBytes: available,
+                isSystemDisk: deviceIdentifier == rootWholeDiskID
+            )
+        }
+
+        return nil
     }
 
     static func collectStaticProbeSnapshot() -> StaticProbeSnapshot {
@@ -3914,6 +4164,246 @@ private enum MonitorProbe {
                 result[pid] = total
             }
         }
+        return result
+    }
+
+    static func wholeMediaChild(of service: io_registry_entry_t) -> io_registry_entry_t? {
+        var iterator: io_iterator_t = 0
+        guard IORegistryEntryGetChildIterator(service, kIOServicePlane, &iterator) == KERN_SUCCESS else {
+            return nil
+        }
+        defer { IOObjectRelease(iterator) }
+
+        while true {
+            let child = IOIteratorNext(iterator)
+            if child == 0 { break }
+            let props = registryProperties(child)
+            if let bsd = props["BSD Name"] as? String, !bsd.isEmpty, (props["Whole"] as? Bool) == true {
+                return child
+            }
+            IOObjectRelease(child)
+        }
+
+        return nil
+    }
+
+    static func registryProperties(_ entry: io_registry_entry_t) -> [String: Any] {
+        var properties: Unmanaged<CFMutableDictionary>?
+        guard IORegistryEntryCreateCFProperties(entry, &properties, kCFAllocatorDefault, 0) == KERN_SUCCESS,
+              let dictionary = properties?.takeRetainedValue() as? [String: Any]
+        else {
+            return [:]
+        }
+        return dictionary
+    }
+
+    static func ioRegistryName(_ entry: io_registry_entry_t) -> String {
+        var name = [CChar](repeating: 0, count: 128)
+        guard IORegistryEntryGetName(entry, &name) == KERN_SUCCESS else { return "" }
+        let prefix = name.prefix { $0 != 0 }
+        return String(decoding: prefix.map { UInt8(bitPattern: $0) }, as: UTF8.self)
+    }
+
+    static func diskutilInfo(deviceIdentifier: String) -> [String: Any]? {
+        guard let data = try? Process.runAndCapture("/usr/sbin/diskutil", ["info", "-plist", "/dev/\(deviceIdentifier)"]) else {
+            return nil
+        }
+        return (try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)) as? [String: Any]
+    }
+
+    static func resolveDiskKind(
+        deviceIdentifier: String,
+        mediaProps: [String: Any],
+        model: String,
+        service: io_registry_entry_t,
+        media: io_registry_entry_t
+    ) -> String {
+        let registryHints = registryHintStrings(for: service) + registryHintStrings(for: media)
+
+        if let info = diskutilInfo(deviceIdentifier: deviceIdentifier) {
+            let isInternal = (info["Internal"] as? Bool) ?? false
+            let removableExternal = (info["RemovableMediaOrExternalDevice"] as? Bool) ?? false
+            let removableMedia = (info["RemovableMedia"] as? Bool) ?? false
+            let ejectable = (info["Ejectable"] as? Bool) ?? false
+            let busProtocol = (info["BusProtocol"] as? String) ?? ""
+            let deviceTreePath = (info["DeviceTreePath"] as? String) ?? ""
+            let solidState = (info["SolidState"] as? Bool) ?? model.localizedCaseInsensitiveContains("SSD")
+
+            if !isInternal || removableExternal || removableMedia || ejectable {
+                return "Removable"
+            }
+
+            return normalizedInternalDiskInterface(
+                busProtocol: busProtocol,
+                deviceTreePath: deviceTreePath,
+                solidState: solidState,
+                registryHints: registryHints
+            )
+        }
+
+        let removable = (mediaProps["Removable"] as? Bool) ?? false || ((mediaProps["Ejectable"] as? Bool) ?? false)
+        if removable {
+            return "Removable"
+        }
+        if isLikelyExternalDisk(registryHints: registryHints) {
+            return "Removable"
+        }
+        return normalizedInternalDiskInterface(
+            busProtocol: "",
+            deviceTreePath: "",
+            solidState: model.localizedCaseInsensitiveContains("SSD"),
+            registryHints: registryHints,
+            fallbackLabel: "Unknown"
+        )
+    }
+
+    static func normalizedInternalDiskInterface(
+        busProtocol: String,
+        deviceTreePath: String,
+        solidState: Bool,
+        registryHints: [String],
+        fallbackLabel: String = "Internal"
+    ) -> String {
+        let lowerBus = busProtocol.lowercased()
+        let lowerTreePath = deviceTreePath.lowercased()
+        let lowerHints = registryHints.joined(separator: " ").lowercased()
+        let combinedHints = [lowerBus, lowerTreePath, lowerHints]
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+
+        if combinedHints.contains("ionvmefamily")
+            || combinedHints.contains("nvmexpress")
+            || combinedHints.contains("ioembeddednvmeblockdevice")
+            || combinedHints.contains("appleembeddednvmetemperaturesensor")
+            || combinedHints.contains("nvme")
+            || combinedHints.contains("appleans")
+            || combinedHints.contains("apple fabric")
+        {
+            return "NVMe"
+        }
+        if solidState && (combinedHints.contains("pci") || combinedHints.contains("pcie")) {
+            return "NVMe"
+        }
+        if combinedHints.contains("sata")
+            || combinedHints.contains("ata")
+            || combinedHints.contains("ahci")
+        {
+            return "SATA"
+        }
+        if combinedHints.contains("ide") {
+            return "IDE"
+        }
+        return busProtocol.isEmpty ? fallbackLabel : busProtocol
+    }
+
+    static func registryHintStrings(for entry: io_registry_entry_t, maxDepth: Int = 8) -> [String] {
+        var hints: [String] = []
+        var current = entry
+        var depth = 0
+        var releaseCurrent = false
+
+        while current != 0, depth < maxDepth {
+            hints.append(ioRegistryName(current))
+            appendRegistryHintProperties(from: current, into: &hints)
+
+            var parent: io_registry_entry_t = 0
+            guard IORegistryEntryGetParentEntry(current, kIOServicePlane, &parent) == KERN_SUCCESS, parent != 0 else {
+                break
+            }
+
+            if releaseCurrent {
+                IOObjectRelease(current)
+            }
+            current = parent
+            releaseCurrent = true
+            depth += 1
+        }
+
+        if releaseCurrent, current != 0 {
+            IOObjectRelease(current)
+        }
+
+        return hints
+    }
+
+    static func appendRegistryHintProperties(from entry: io_registry_entry_t, into hints: inout [String]) {
+        let properties = registryProperties(entry)
+        let stringKeys = [
+            "IOClass",
+            "CFBundleIdentifier",
+            "Physical Interconnect",
+            "Physical Interconnect Location",
+            "device-type",
+            "Protocol",
+            "Model Number",
+            "MediaName"
+        ]
+
+        for key in stringKeys {
+            if let value = properties[key] as? String, !value.isEmpty {
+                hints.append(value)
+            }
+        }
+
+        if let protocolCharacteristics = properties["Protocol Characteristics"] as? [String: Any] {
+            if let interconnect = protocolCharacteristics["Physical Interconnect"] as? String, !interconnect.isEmpty {
+                hints.append(interconnect)
+            }
+            if let location = protocolCharacteristics["Physical Interconnect Location"] as? String, !location.isEmpty {
+                hints.append(location)
+            }
+        }
+    }
+
+    static func isLikelyExternalDisk(registryHints: [String]) -> Bool {
+        let combinedHints = registryHints.joined(separator: " ").lowercased()
+        let externalMarkers = [
+            "external",
+            "usb",
+            "thunderbolt",
+            "firewire",
+            "sdxc",
+            "sd card",
+            "card reader",
+            "cardreader",
+            "mass storage",
+            "removable",
+            "portable"
+        ]
+        return externalMarkers.contains { combinedHints.contains($0) }
+    }
+
+    static func mountedDiskInfoByWholeDisk() -> [String: (availableBytes: UInt64, label: String)] {
+        let manager = FileManager.default
+        let keys: Set<URLResourceKey> = [.volumeLocalizedNameKey, .volumeNameKey, .volumeAvailableCapacityKey]
+        let urls = manager.mountedVolumeURLs(includingResourceValuesForKeys: Array(keys), options: [.skipHiddenVolumes]) ?? []
+        var result: [String: (availableBytes: UInt64, label: String)] = [:]
+
+        for url in urls {
+            var stats = statfs()
+            guard statfs(url.path, &stats) == 0 else { continue }
+            let source = withUnsafePointer(to: &stats.f_mntfromname) {
+                $0.withMemoryRebound(to: CChar.self, capacity: Int(MNAMELEN)) { pointer in
+                    String(cString: pointer)
+                }
+            }
+            guard let wholeDisk = wholeDiskIdentifier(fromDevicePath: source) else { continue }
+
+            let values = try? url.resourceValues(forKeys: keys)
+            let label = values?.volumeLocalizedName ?? values?.volumeName ?? url.lastPathComponent
+            let available = UInt64(values?.volumeAvailableCapacity ?? 0)
+
+            if var existing = result[wholeDisk] {
+                existing.availableBytes += available
+                if existing.label == wholeDisk {
+                    existing.label = label
+                }
+                result[wholeDisk] = existing
+            } else {
+                result[wholeDisk] = (available, label)
+            }
+        }
+
         return result
     }
 
@@ -4007,7 +4497,178 @@ private enum MonitorProbe {
         )
     }
 
-    static func collectGPUStates(previous: [GPUState], language: AppLanguage) -> [GPUState] {
+    static func statisticDouble(_ dictionary: [String: Any]?, keys: [String]) -> Double? {
+        guard let dictionary else { return nil }
+        for key in keys {
+            if let number = dictionary[key] as? NSNumber {
+                return number.doubleValue
+            }
+            if let text = dictionary[key] as? String {
+                let cleaned = text.replacingOccurrences(of: ",", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+                if let value = Double(cleaned) {
+                    return value
+                }
+            }
+        }
+        return nil
+    }
+
+    static func statisticUInt64(_ dictionary: [String: Any]?, keys: [String]) -> UInt64? {
+        guard let dictionary else { return nil }
+        for key in keys {
+            if let number = dictionary[key] as? NSNumber {
+                return number.uint64Value
+            }
+            if let text = dictionary[key] as? String {
+                let cleaned = text.replacingOccurrences(of: ",", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+                if let value = UInt64(cleaned) {
+                    return value
+                }
+            }
+        }
+        return nil
+    }
+
+    static func byteCount(fromProfilerValue value: Any?) -> UInt64? {
+        if let number = value as? NSNumber {
+            return number.uint64Value
+        }
+        guard let text = value as? String else { return nil }
+        let cleaned = text.replacingOccurrences(of: ",", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let pattern = #"([0-9]+(?:\.[0-9]+)?)"#
+        guard let match = extractFirstMatch(in: cleaned, pattern: pattern),
+              let numericValue = Double(match)
+        else {
+            return nil
+        }
+
+        let uppercased = cleaned.uppercased()
+        let multiplier: Double
+        if uppercased.contains("TB") {
+            multiplier = 1_099_511_627_776
+        } else if uppercased.contains("GB") {
+            multiplier = 1_073_741_824
+        } else if uppercased.contains("MB") {
+            multiplier = 1_048_576
+        } else if uppercased.contains("KB") {
+            multiplier = 1_024
+        } else {
+            multiplier = 1
+        }
+
+        return UInt64(max(numericValue * multiplier, 0))
+    }
+
+    static func dedicatedVRAMTotalBytes(profilerItem: [String: Any]?, ioEntry: [String: Any]?) -> UInt64 {
+        if let profileValue = byteCount(fromProfilerValue: profilerItem?["spdisplays_vram"])
+            ?? byteCount(fromProfilerValue: profilerItem?["sppci_vram"]),
+           profileValue > 0
+        {
+            return profileValue
+        }
+
+        if let vramMB = statisticUInt64(ioEntry, keys: ["VRAM,totalMB"]), vramMB > 0 {
+            return vramMB * 1_048_576
+        }
+
+        return 0
+    }
+
+    static func isAMDGPU(model: String, device: any MTLDevice, profilerItem: [String: Any]?, ioEntry: [String: Any]?) -> Bool {
+        let candidates = [
+            model,
+            device.name,
+            profilerItem?["spdisplays_vendor"] as? String ?? "",
+            profilerItem?["sppci_model"] as? String ?? "",
+            profilerItem?["_name"] as? String ?? "",
+            ioEntry?["IOClass"] as? String ?? "",
+            ioEntry?["IOObjectClass"] as? String ?? "",
+            ioEntry?["CFBundleIdentifier"] as? String ?? ""
+        ]
+        let haystack = candidates.joined(separator: " ").lowercased()
+        return haystack.contains("amd") || haystack.contains("radeon")
+    }
+
+    static func isIntelGPU(model: String, device: any MTLDevice, profilerItem: [String: Any]?) -> Bool {
+        let candidates = [
+            model,
+            device.name,
+            profilerItem?["spdisplays_vendor"] as? String ?? "",
+            profilerItem?["sppci_model"] as? String ?? "",
+            profilerItem?["_name"] as? String ?? ""
+        ]
+        let haystack = candidates.joined(separator: " ").lowercased()
+        return haystack.contains("intel")
+            || haystack.contains("iris")
+            || haystack.contains("uhd")
+            || haystack.contains("hd graphics")
+    }
+
+    static func profilerIdentityScore(device: any MTLDevice, profilerItem: [String: Any], cpuArchitecture: CPUArchitecture) -> Int {
+        let model = (profilerItem["sppci_model"] as? String ?? profilerItem["_name"] as? String ?? "").lowercased()
+        let vendor = (profilerItem["spdisplays_vendor"] as? String ?? "").lowercased()
+        let deviceName = device.name.lowercased()
+        var score = 0
+
+        if !model.isEmpty {
+            if model == deviceName {
+                score += 200
+            } else if model.contains(deviceName) || deviceName.contains(model) {
+                score += 120
+            }
+        }
+
+        if cpuArchitecture == .intelLike {
+            let itemLooksAMD = model.contains("radeon") || vendor.contains("amd")
+            let itemLooksIntel = model.contains("intel") || model.contains("iris") || model.contains("uhd") || vendor.contains("intel")
+            let deviceLooksAMD = deviceName.contains("radeon") || deviceName.contains("amd")
+            let deviceLooksIntel = deviceName.contains("intel") || deviceName.contains("iris") || deviceName.contains("uhd")
+
+            if itemLooksAMD && deviceLooksAMD {
+                score += 80
+            }
+            if itemLooksIntel && deviceLooksIntel {
+                score += 80
+            }
+        }
+
+        return score
+    }
+
+    static func profilerItemIndex(for device: any MTLDevice, profilerItems: [[String: Any]], availableIndices: [Int], cpuArchitecture: CPUArchitecture) -> Int? {
+        guard !availableIndices.isEmpty else { return nil }
+        let scored = availableIndices.map { index in
+            (index, profilerIdentityScore(device: device, profilerItem: profilerItems[index], cpuArchitecture: cpuArchitecture))
+        }
+        if let best = scored.max(by: { $0.1 < $1.1 }), best.1 > 0 {
+            return best.0
+        }
+        return availableIndices.first
+    }
+
+    static func gpuTypeText(
+        cpuArchitecture: CPUArchitecture,
+        device: any MTLDevice,
+        profilerItem: [String: Any]?,
+        ioEntry: [String: Any]?,
+        model: String,
+        dedicatedMemoryTotalBytes: UInt64,
+        language: AppLanguage
+    ) -> String {
+        if cpuArchitecture == .intelLike {
+            let amd = isAMDGPU(model: model, device: device, profilerItem: profilerItem, ioEntry: ioEntry)
+            let intel = isIntelGPU(model: model, device: device, profilerItem: profilerItem)
+            if dedicatedMemoryTotalBytes > 0 || amd {
+                return language.text("独立", "Discrete")
+            }
+            if intel || device.isLowPower {
+                return language.text("集成", "Integrated")
+            }
+        }
+        return resolvedGPUType(device: device, profilerItem: profilerItem, language: language)
+    }
+
+    static func collectGPUStates(previous: [GPUState], language: AppLanguage, cpuArchitecture: CPUArchitecture) -> [GPUState] {
         guard
             let profilerData = try? Process.runAndCapture("/usr/sbin/system_profiler", ["SPDisplaysDataType", "-json"]),
             let profilerJSON = try? JSONSerialization.jsonObject(with: profilerData) as? [String: Any],
@@ -4028,15 +4689,21 @@ private enum MonitorProbe {
         )
 
         var next: [GPUState] = []
-        let gpuCount = max(profilerItems.count, devices.count)
+        var availableProfilerIndices = Array(profilerItems.indices)
+        let gpuCount = devices.count
 
         for (index, device) in devices.enumerated() {
             let ioEntry = acceleratorByRegistryID[device.registryID]
-            let matchedProfilerItem = profilerItems.first { item in
-                let itemModel = item["sppci_model"] as? String ?? item["_name"] as? String ?? ""
-                if itemModel.isEmpty { return false }
-                return itemModel.localizedCaseInsensitiveContains(device.name) || device.name.localizedCaseInsensitiveContains(itemModel)
-            } ?? profilerItems[safe: index]
+            let matchedProfilerIndex = profilerItemIndex(
+                for: device,
+                profilerItems: profilerItems,
+                availableIndices: availableProfilerIndices,
+                cpuArchitecture: cpuArchitecture
+            )
+            if let matchedProfilerIndex {
+                availableProfilerIndices.removeAll { $0 == matchedProfilerIndex }
+            }
+            let matchedProfilerItem = matchedProfilerIndex.flatMap { profilerItems[safe: $0] }
 
             let model = matchedProfilerItem?["sppci_model"] as? String
                 ?? matchedProfilerItem?["_name"] as? String
@@ -4044,18 +4711,53 @@ private enum MonitorProbe {
             let metalRaw = matchedProfilerItem?["spdisplays_mtlgpufamilysupport"] as? String ?? ""
             let metalVersion = resolvedMetalVersion(raw: metalRaw, device: device)
             let coreCount = Int(matchedProfilerItem?["sppci_cores"] as? String ?? "") ?? 0
-            let gpuType = resolvedGPUType(device: device, profilerItem: matchedProfilerItem, language: language)
 
             let performance = ioEntry?["PerformanceStatistics"] as? [String: Any]
-            let deviceUtil = (performance?["Device Utilization %"] as? NSNumber)?.doubleValue ?? 0
-            let rendererUtil = (performance?["Renderer Utilization %"] as? NSNumber)?.doubleValue ?? 0
-            let tilerUtil = (performance?["Tiler Utilization %"] as? NSNumber)?.doubleValue ?? 0
-            let inUseMemory = (performance?["In use system memory"] as? NSNumber)?.uint64Value ?? 0
-            let performanceAllocatedMemory = (performance?["Alloc system memory"] as? NSNumber)?.uint64Value ?? 0
+            let deviceUtil = statisticDouble(
+                performance,
+                keys: ["Device Utilization %", "GPU Activity(%)", "Device Utilization % at cur p-state"]
+            ) ?? 0
+            let rawRendererUtil = statisticDouble(
+                performance,
+                keys: ["Renderer Utilization %", "3D Utilization %", "3D Engine Utilization %"]
+            )
+            let rawTilerUtil = statisticDouble(
+                performance,
+                keys: ["Tiler Utilization %", "Tiler/Copy Utilization %", "Copy Engine Utilization %"]
+            )
+            let inUseMemory = statisticUInt64(
+                performance,
+                keys: ["In use system memory", "inUseSysMemoryBytes", "gartUsedBytes"]
+            ) ?? 0
+            let performanceAllocatedMemory = statisticUInt64(
+                performance,
+                keys: ["Alloc system memory", "allocSysMemoryBytes", "gartSizeBytes"]
+            ) ?? 0
             let recommendedWorkingSet = device.recommendedMaxWorkingSetSize
             let allocatedMemory = max(
                 inUseMemory,
                 recommendedWorkingSet > 0 ? recommendedWorkingSet : performanceAllocatedMemory
+            )
+            let dedicatedTotalMemory = cpuArchitecture == .intelLike
+                ? dedicatedVRAMTotalBytes(profilerItem: matchedProfilerItem, ioEntry: ioEntry)
+                : 0
+            let dedicatedUsedMemory = dedicatedTotalMemory > 0
+                ? min(
+                    statisticUInt64(performance, keys: ["In use video memory", "inUseVidMemoryBytes"]) ?? 0,
+                    dedicatedTotalMemory
+                )
+                : 0
+            let supportsEngineBreakdown = rawRendererUtil != nil && rawTilerUtil != nil && dedicatedTotalMemory == 0
+            let rendererUtil = supportsEngineBreakdown ? (rawRendererUtil ?? 0) : 0
+            let tilerUtil = supportsEngineBreakdown ? (rawTilerUtil ?? 0) : 0
+            let gpuType = gpuTypeText(
+                cpuArchitecture: cpuArchitecture,
+                device: device,
+                profilerItem: matchedProfilerItem,
+                ioEntry: ioEntry,
+                model: model,
+                dedicatedMemoryTotalBytes: dedicatedTotalMemory,
+                language: language
             )
             let openGLVersion: String? = nil
 
@@ -4064,7 +4766,9 @@ private enum MonitorProbe {
             let historyOverall = shifted(previousState?.historyOverall ?? Array(repeating: 0, count: 60), adding: deviceUtil)
             let history3D = shifted(previousState?.history3D ?? Array(repeating: 0, count: 60), adding: rendererUtil)
             let historyTiler = shifted(previousState?.historyTiler ?? Array(repeating: 0, count: 60), adding: tilerUtil)
-            let memoryPercent = allocatedMemory > 0 ? min(Double(inUseMemory) / Double(allocatedMemory) * 100, 100) : 0
+            let displayedMemoryUsed = dedicatedTotalMemory > 0 ? dedicatedUsedMemory : inUseMemory
+            let displayedMemoryTotal = dedicatedTotalMemory > 0 ? dedicatedTotalMemory : allocatedMemory
+            let memoryPercent = displayedMemoryTotal > 0 ? min(Double(displayedMemoryUsed) / Double(displayedMemoryTotal) * 100, 100) : 0
             let memoryHistory = shifted(previousState?.memoryHistory ?? Array(repeating: 0, count: 60), adding: memoryPercent)
 
             next.append(GPUState(
@@ -4080,6 +4784,9 @@ private enum MonitorProbe {
                 tilerUtilizationPercent: tilerUtil,
                 sharedMemoryUsedBytes: inUseMemory,
                 sharedMemoryAllocatedBytes: allocatedMemory,
+                dedicatedMemoryUsedBytes: dedicatedUsedMemory,
+                dedicatedMemoryTotalBytes: dedicatedTotalMemory,
+                supportsEngineBreakdown: supportsEngineBreakdown,
                 metalVersion: metalVersion,
                 openGLVersion: openGLVersion,
                 historyOverall: historyOverall,

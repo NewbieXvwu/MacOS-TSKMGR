@@ -19,10 +19,12 @@ struct PerformancePageView: View {
     }
 
     @Environment(\.appLanguage) private var language
+    @Environment(\.menuVisualStyle) private var menuVisualStyle
     @Environment(\.temperatureUnit) private var temperatureUnit
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject var monitor: SystemMonitor
     @Binding var selectedPerf: PerfSelection
+    var highlightedPerf: PerfSelection? = nil
     @Binding var viewMode: PerformanceViewMode
     @Binding var showsGraphs: Bool
     @Binding var cpuGraphMode: CPUGraphMode
@@ -74,11 +76,15 @@ struct PerformancePageView: View {
                     .onAppear {
                         sidebarWidth = clampedSidebarWidth
                     }
-                    .onChange(of: proxy.size.width) { _ in
+                    .onChange(of: proxy.size.width) {
                         sidebarWidth = min(max(sidebarWidth, minWidth), maxWidth)
                     }
                 }
             }
+        }
+        .onChange(of: menuVisualStyle) { _, _ in
+            openGPUMenu = nil
+            openNPUMenu = nil
         }
     }
 
@@ -157,7 +163,8 @@ struct PerformancePageView: View {
     }
 
     private func sidebarRow(_ item: PerfSidebarItem, summaryMode: Bool) -> some View {
-        HStack(spacing: 10) {
+        let activeSidebarSelection = highlightedPerf ?? selectedPerf
+        return HStack(spacing: 10) {
             if showsGraphs {
                 GridChart(values: item.sparkline, color: item.accent, verticalSteps: 0, horizontalSteps: 0, lineWidth: 1.1, filled: true, ceiling: 100, contentInset: 1.2)
                     .frame(width: 58, height: 42)
@@ -197,7 +204,7 @@ struct PerformancePageView: View {
         }
         .padding(.horizontal, summaryMode ? 10 : 8)
         .padding(.vertical, 10)
-        .background(selectedPerf == item.id ? item.selectedFill : Color.clear)
+        .background(activeSidebarSelection == item.id ? item.selectedFill : Color.clear)
         .contentShape(Rectangle())
         .onTapGesture {
             selectedPerf = item.id
@@ -471,6 +478,15 @@ struct PerformancePageView: View {
         return false
     }
 
+    private var selectedGPUSupportsEngineBreakdown: Bool {
+        guard case .gpu(let id) = selectedPerf,
+              let gpu = monitor.gpus.first(where: { $0.id == id })
+        else {
+            return true
+        }
+        return gpu.supportsEngineBreakdown
+    }
+
     private var isNPU: Bool {
         if case .npu = selectedPerf { return true }
         return false
@@ -729,25 +745,65 @@ struct PerformancePageView: View {
     }
 
     private func gpuHeader(title: String, valueText: String, target: GPUGraphMenuTarget) -> some View {
-        Button {
-            openGPUMenu = openGPUMenu == target ? nil : target
-        } label: {
-            HStack(spacing: 4) {
-                HStack(spacing: 4) {
-                    Text(title)
-                        .font(.system(size: 13))
-                        .foregroundStyle(.secondary)
-                    Image(systemName: "chevron.down")
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundStyle(.secondary)
+        Group {
+            if menuVisualStyle == .macOS26 {
+                Menu {
+                    ForEach(GPUGraphKind.allCases) { kind in
+                        if isGPUKindAvailable(kind) {
+                            Button {
+                                if target == .left {
+                                    leftGPUSelection = kind
+                                } else {
+                                    rightGPUSelection = kind
+                                }
+                            } label: {
+                                if currentGPUSelection(for: target) == kind {
+                                    Label(kind.title(in: language), systemImage: "checkmark")
+                                } else {
+                                    Text(kind.title(in: language))
+                                }
+                            }
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        HStack(spacing: 4) {
+                            Text(title)
+                                .font(.system(size: 13))
+                                .foregroundStyle(.secondary)
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 0)
+                        Text(valueText)
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                    }
                 }
-                Spacer(minLength: 0)
-                Text(valueText)
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
+                .menuStyle(.borderlessButton)
+            } else {
+                Button {
+                    openGPUMenu = openGPUMenu == target ? nil : target
+                } label: {
+                    HStack(spacing: 4) {
+                        HStack(spacing: 4) {
+                            Text(title)
+                                .font(.system(size: 13))
+                                .foregroundStyle(.secondary)
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 0)
+                        Text(valueText)
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .buttonStyle(.plain)
             }
         }
-        .buttonStyle(.plain)
     }
 
     private func gpuMenu(target: GPUGraphMenuTarget) -> some View {
@@ -803,7 +859,22 @@ struct PerformancePageView: View {
 
     private func gpuGraphContainer(_ detail: PerformanceDetailViewData, chartHeights: PerformanceChartHeights) -> some View {
         Group {
-            if gpuGraphLayoutMode == .singleEngine {
+            if !selectedGPUSupportsEngineBreakdown {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 4) {
+                        Text(GPUGraphKind.overall.title(in: language))
+                            .font(.system(size: 13))
+                            .foregroundStyle(.secondary)
+                        Spacer(minLength: 0)
+                        Text(gpuValueText(for: .overall, detail: detail))
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                    }
+                    GridChart(values: gpuValues(for: .overall, detail: detail), color: detail.accent, filled: true)
+                        .frame(height: chartHeights.gpuSingle)
+                        .overlay(Rectangle().stroke(detail.accent, lineWidth: 1))
+                }
+            } else if gpuGraphLayoutMode == .singleEngine {
                 VStack(alignment: .leading, spacing: 4) {
                     gpuHeader(title: leftGPUSelection.title(in: language), valueText: gpuValueText(for: leftGPUSelection, detail: detail), target: .left)
                     GridChart(values: gpuValues(for: leftGPUSelection, detail: detail), color: detail.accent, filled: true)
@@ -847,7 +918,7 @@ struct PerformancePageView: View {
             }
         }
         .contentShape(Rectangle())
-        .id("gpu-detail-\(selectedPerf.id)-\(gpuGraphLayoutMode == .singleEngine ? "single" : "multi")-\(leftGPUSelection.rawValue)-\(rightGPUSelection.rawValue)")
+        .id("gpu-detail-\(selectedPerf.id)-\(selectedGPUSupportsEngineBreakdown)-\(gpuGraphLayoutMode == .singleEngine ? "single" : "multi")-\(leftGPUSelection.rawValue)-\(rightGPUSelection.rawValue)")
     }
 
     private func gpuValues(for kind: GPUGraphKind, detail: PerformanceDetailViewData) -> [Double] {
@@ -870,12 +941,14 @@ struct PerformancePageView: View {
 
     private func gpuContextMenu() -> some View {
         Group {
-            Menu(language.text("将图形更改为", "Change graph to")) {
-                Button(language.text("单个引擎", "Single engine")) {
-                    gpuGraphLayoutMode = .singleEngine
-                }
-                Button(language.text("多个引擎", "Multiple engines")) {
-                    gpuGraphLayoutMode = .multiEngine
+            if selectedGPUSupportsEngineBreakdown {
+                Menu(language.text("将图形更改为", "Change graph to")) {
+                    Button(language.text("单个引擎", "Single engine")) {
+                        gpuGraphLayoutMode = .singleEngine
+                    }
+                    Button(language.text("多个引擎", "Multiple engines")) {
+                        gpuGraphLayoutMode = .multiEngine
+                    }
                 }
             }
             Button(viewMode == .detailSummary ? language.text("图形完整视图", "Graph full view") : language.text("图形摘要视图", "Graph summary view")) {
@@ -1073,25 +1146,63 @@ struct PerformancePageView: View {
     }
 
     private func npuHeader(valueText: String, graphKind: NPUGraphKind, target: NPUGraphMenuTarget) -> some View {
-        return Button {
-            openNPUMenu = openNPUMenu == target ? nil : target
-        } label: {
-            HStack(spacing: 4) {
-                HStack(spacing: 4) {
-                    Text(graphKind.title(in: language))
-                        .font(.system(size: 13))
-                        .foregroundStyle(.secondary)
-                    Image(systemName: "chevron.down")
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundStyle(.secondary)
+        return Group {
+            if menuVisualStyle == .macOS26 {
+                Menu {
+                    ForEach(NPUGraphKind.allCases) { kind in
+                        Button {
+                            if target == .left {
+                                leftNPUGraphKind = kind
+                            } else {
+                                rightNPUGraphKind = kind
+                            }
+                        } label: {
+                            if graphKind == kind {
+                                Label(kind.title(in: language), systemImage: "checkmark")
+                            } else {
+                                Text(kind.title(in: language))
+                            }
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        HStack(spacing: 4) {
+                            Text(graphKind.title(in: language))
+                                .font(.system(size: 13))
+                                .foregroundStyle(.secondary)
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 0)
+                        Text(valueText)
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                    }
                 }
-                Spacer(minLength: 0)
-                Text(valueText)
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
+                .menuStyle(.borderlessButton)
+            } else {
+                Button {
+                    openNPUMenu = openNPUMenu == target ? nil : target
+                } label: {
+                    HStack(spacing: 4) {
+                        HStack(spacing: 4) {
+                            Text(graphKind.title(in: language))
+                                .font(.system(size: 13))
+                                .foregroundStyle(.secondary)
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 0)
+                        Text(valueText)
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .buttonStyle(.plain)
             }
         }
-        .buttonStyle(.plain)
     }
 
     private func npuMenu(target: NPUGraphMenuTarget) -> some View {

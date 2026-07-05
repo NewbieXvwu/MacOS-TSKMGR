@@ -73,6 +73,10 @@ extension View {
     func winMenuPanel() -> some View {
         modifier(ThemeMenuPanelModifier())
     }
+
+    func interactiveHitTarget() -> some View {
+        contentShape(Rectangle())
+    }
 }
 
 private struct ThemeMenuPanelModifier: ViewModifier {

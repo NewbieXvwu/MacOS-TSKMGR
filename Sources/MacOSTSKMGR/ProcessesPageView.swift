@@ -32,8 +32,9 @@ struct ProcessesPageView: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.appLanguage) private var language
     @ObservedObject var monitor: SystemMonitor
-    @Binding var collapsedSections: Set<String>
+    @Binding var collapsedSections: Set<ProcessSectionKind>
     @Binding var selectedPID: Int32?
+    var selectedSectionKind: ProcessSectionKind? = nil
     @Binding var memoryDisplayMode: ProcessResourceDisplayMode
     @Binding var diskDisplayMode: ProcessResourceDisplayMode
     @Binding var networkDisplayMode: ProcessResourceDisplayMode
@@ -44,8 +45,8 @@ struct ProcessesPageView: View {
     let onShowProperties: (ProcessRowData) -> Void
     let onCopyProcessDetails: (ProcessRowData) -> Void
     let onOpenDetailsTab: (Int32) -> Void
-    @State private var sortKey: ProcessSortKey = .cpu
-    @State private var ascending = false
+    @Binding var sortKey: ProcessSortKey
+    @Binding var ascending: Bool
     @State private var hoveredSortKey: ProcessSortKey?
 
     var body: some View {
@@ -57,11 +58,11 @@ struct ProcessesPageView: View {
                     .frame(width: widths.total, alignment: .leading)
 
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 0) {
+                    LazyVStack(alignment: .leading, spacing: 0) {
                         ForEach(sortedSections) { section in
-                            sectionHeader(section.title, width: widths.total)
+                            sectionHeader(section, width: widths.total)
 
-                            if !collapsedSections.contains(section.title) {
+                            if !collapsedSections.contains(section.kind) {
                                 ForEach(Array(section.rows.enumerated()), id: \.element.id) { index, row in
                                     processDataRow(row, rowIndex: index, widths: widths)
                                 }
@@ -80,7 +81,7 @@ struct ProcessesPageView: View {
 
     private var sortedSections: [ProcessSectionData] {
         monitor.processSections.map { section in
-            ProcessSectionData(title: section.title, rows: section.rows.sorted(by: compareRows))
+            ProcessSectionData(kind: section.kind, rows: section.rows.sorted(by: compareRows))
         }
     }
 
@@ -116,14 +117,14 @@ struct ProcessesPageView: View {
         return total == 0 ? "0%" : "1%"
     }
 
-    private func sectionHeader(_ title: String, width: CGFloat) -> some View {
+    private func sectionHeader(_ section: ProcessSectionData, width: CGFloat) -> some View {
         Button {
-            toggleSection(title)
+            toggleSection(section.kind)
         } label: {
             HStack(spacing: 6) {
-                Image(systemName: collapsedSections.contains(title) ? "chevron.right" : "chevron.down")
+                Image(systemName: collapsedSections.contains(section.kind) ? "chevron.right" : "chevron.down")
                     .font(.system(size: 10, weight: .semibold))
-                Text(language.translateProcessSectionTitle(title))
+                Text(section.title(in: language))
                     .font(.system(size: 15))
             }
             .foregroundStyle(Color(red: 0.16, green: 0.34, blue: 0.77))
@@ -131,6 +132,10 @@ struct ProcessesPageView: View {
             .padding(.bottom, 6)
             .padding(.leading, 10)
             .frame(width: width, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(selectedSectionKind == section.kind ? AppTheme.selectedRow(colorScheme) : Color.clear)
+            )
         }
         .buttonStyle(.plain)
     }
@@ -296,11 +301,11 @@ struct ProcessesPageView: View {
         }
     }
 
-    private func toggleSection(_ title: String) {
-        if collapsedSections.contains(title) {
-            collapsedSections.remove(title)
+    private func toggleSection(_ kind: ProcessSectionKind) {
+        if collapsedSections.contains(kind) {
+            collapsedSections.remove(kind)
         } else {
-            collapsedSections.insert(title)
+            collapsedSections.insert(kind)
         }
     }
 

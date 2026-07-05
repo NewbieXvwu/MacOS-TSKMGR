@@ -1,0 +1,8 @@
+// Single source of truth for app versioning.
+// Update these two values, or use Tools/set_version.sh.
+
+APP_MARKETING_VERSION = 1.1.1
+APP_BUILD_VERSION = 260705v1
+
+MARKETING_VERSION = $(APP_MARKETING_VERSION)
+CURRENT_PROJECT_VERSION = $(APP_BUILD_VERSION)
