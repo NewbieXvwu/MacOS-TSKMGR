@@ -655,7 +655,8 @@ struct PerformancePageView: View {
                 .foregroundStyle(.secondary)
 
             LazyVGrid(columns: [GridItem(.flexible(), spacing: 18), GridItem(.flexible(), spacing: 18)], alignment: .leading, spacing: 14) {
-                ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                ForEach(rows.indices, id: \.self) { index in
+                    let row = rows[index]
                     VStack(alignment: .leading, spacing: 3) {
                         Text(row.0)
                             .font(.system(size: 12))
@@ -972,7 +973,8 @@ struct PerformancePageView: View {
         let columns = Array(repeating: GridItem(.flexible(), spacing: spacing), count: 4)
 
         return LazyVGrid(columns: columns, spacing: spacing) {
-            ForEach(Array(detail.chartSets.enumerated()), id: \.offset) { _, values in
+            ForEach(detail.chartSets.indices, id: \.self) { index in
+                let values = detail.chartSets[index]
                 ZStack {
                     GridChart(values: values, color: detail.accent, filled: true)
                 if showsKernelTime {

@@ -714,6 +714,7 @@ final class SystemMonitor: ObservableObject {
         host_page_size(hostPort, &pageSizeValue)
         self.pageSize = UInt64(pageSizeValue)
         iconCache.countLimit = 512
+        iconCache.totalCostLimit = 4 * 1024 * 1024
         bootstrapStaticInfo()
         rootWholeDiskID = MonitorProbe.rootWholeDiskIdentifierFromMountedRoot()
         configureANEIOReportIfNeeded()
@@ -922,6 +923,10 @@ final class SystemMonitor: ObservableObject {
 
     private var shouldCollectVisibleApps: Bool {
         shouldBuildProcessSections || shouldBuildAppHistory || shouldBuildCurrentUserApps
+    }
+
+    private var shouldSampleProcessResourceUsage: Bool {
+        shouldBuildProcessSections || shouldBuildCurrentUserApps
     }
 
     private var shouldRefreshStartupRows: Bool {
@@ -1396,6 +1401,7 @@ final class SystemMonitor: ObservableObject {
         let pids = listPIDs()
         let logicalCores = max(cpu.logicalCores, 1)
         let shouldBuildSnapshots = shouldBuildDetailRows
+        let shouldSampleResourceUsage = shouldSampleProcessResourceUsage
         var rowsByPID: [Int32: ProcessRowData] = [:]
         rowsByPID.reserveCapacity(pids.count)
         var snapshotsByPID: [Int32: ProcessSnapshot] = [:]
@@ -1404,18 +1410,18 @@ final class SystemMonitor: ObservableObject {
         }
 
         var newCPUCache: [Int32: UInt64] = [:]
-        var newRUsageCache: [Int32: (UInt64, UInt64)] = [:]
-        var newEnergyCache: [Int32: UInt64] = [:]
-        var newPackageWakeupCache: [Int32: UInt64] = [:]
-        var newInterruptWakeupCache: [Int32: UInt64] = [:]
-        var nextPowerTrendWatts: [Int32: Double] = [:]
+        var newRUsageCache = previousProcessRUsage
+        var newEnergyCache = previousProcessEnergyNanojoules
+        var newPackageWakeupCache = previousProcessPackageIdleWakeups
+        var newInterruptWakeupCache = previousProcessInterruptWakeups
+        var nextPowerTrendWatts = processPowerTrendWatts
         let processNetworkTotals = self.processNetworkTotals
         var newNetworkCache: [Int32: UInt64] = [:]
         var totalThreadCount = 0
         var totalOpenFilesCount = 0
 
         for pid in pids where pid > 0 {
-            guard let info = processInfo(pid: pid) else { continue }
+            guard let info = processInfo(pid: pid, includeResourceUsage: shouldSampleResourceUsage) else { continue }
             if shouldBuildSnapshots {
                 snapshotsByPID[pid] = info
             }
@@ -1431,32 +1437,39 @@ final class SystemMonitor: ObservableObject {
             }
             newCPUCache[pid] = totalCPU
 
-            let currentDisk: (read: UInt64, write: UInt64) = (info.diskReadBytes, info.diskWriteBytes)
-            let previousDisk = previousProcessRUsage[pid] ?? currentDisk
-            let diskDelta = (currentDisk.read >= previousDisk.read ? currentDisk.read - previousDisk.read : 0) + (currentDisk.write >= previousDisk.write ? currentDisk.write - previousDisk.write : 0)
-            let diskPerSecond = UInt64(Double(diskDelta) / interval)
-            newRUsageCache[pid] = currentDisk
+            var diskPerSecond: UInt64 = 0
+            var powerUsageWatts = 0.0
+            var powerTrendWatts = processPowerTrendWatts[pid] ?? 0
+            var totalWakeupsPerSecond = 0.0
 
-            let energyNanojoules = info.energyNanojoules
-            let previousEnergy = previousProcessEnergyNanojoules[pid] ?? energyNanojoules
-            let energyDelta = energyNanojoules >= previousEnergy ? energyNanojoules - previousEnergy : 0
-            let powerUsageWatts = Double(energyDelta) / 1_000_000_000.0 / interval
-            newEnergyCache[pid] = energyNanojoules
+            if shouldSampleResourceUsage {
+                let currentDisk: (read: UInt64, write: UInt64) = (info.diskReadBytes, info.diskWriteBytes)
+                let previousDisk = previousProcessRUsage[pid] ?? currentDisk
+                let diskDelta = (currentDisk.read >= previousDisk.read ? currentDisk.read - previousDisk.read : 0) + (currentDisk.write >= previousDisk.write ? currentDisk.write - previousDisk.write : 0)
+                diskPerSecond = UInt64(Double(diskDelta) / interval)
+                newRUsageCache[pid] = currentDisk
 
-            let packageWakeups = info.packageIdleWakeups
-            let previousPackageWakeups = previousProcessPackageIdleWakeups[pid] ?? packageWakeups
-            let packageWakeupDelta = packageWakeups >= previousPackageWakeups ? packageWakeups - previousPackageWakeups : 0
-            newPackageWakeupCache[pid] = packageWakeups
+                let energyNanojoules = info.energyNanojoules
+                let previousEnergy = previousProcessEnergyNanojoules[pid] ?? energyNanojoules
+                let energyDelta = energyNanojoules >= previousEnergy ? energyNanojoules - previousEnergy : 0
+                powerUsageWatts = Double(energyDelta) / 1_000_000_000.0 / interval
+                newEnergyCache[pid] = energyNanojoules
 
-            let interruptWakeups = info.interruptWakeups
-            let previousInterruptWakeups = previousProcessInterruptWakeups[pid] ?? interruptWakeups
-            let interruptWakeupDelta = interruptWakeups >= previousInterruptWakeups ? interruptWakeups - previousInterruptWakeups : 0
-            newInterruptWakeupCache[pid] = interruptWakeups
+                let packageWakeups = info.packageIdleWakeups
+                let previousPackageWakeups = previousProcessPackageIdleWakeups[pid] ?? packageWakeups
+                let packageWakeupDelta = packageWakeups >= previousPackageWakeups ? packageWakeups - previousPackageWakeups : 0
+                newPackageWakeupCache[pid] = packageWakeups
 
-            let totalWakeupsPerSecond = Double(packageWakeupDelta + interruptWakeupDelta) / interval
-            let previousTrend = processPowerTrendWatts[pid] ?? powerUsageWatts
-            let powerTrendWatts = previousTrend * 0.74 + powerUsageWatts * 0.26
-            nextPowerTrendWatts[pid] = powerTrendWatts
+                let interruptWakeups = info.interruptWakeups
+                let previousInterruptWakeups = previousProcessInterruptWakeups[pid] ?? interruptWakeups
+                let interruptWakeupDelta = interruptWakeups >= previousInterruptWakeups ? interruptWakeups - previousInterruptWakeups : 0
+                newInterruptWakeupCache[pid] = interruptWakeups
+
+                totalWakeupsPerSecond = Double(packageWakeupDelta + interruptWakeupDelta) / interval
+                let previousTrend = processPowerTrendWatts[pid] ?? powerUsageWatts
+                powerTrendWatts = previousTrend * 0.74 + powerUsageWatts * 0.26
+                nextPowerTrendWatts[pid] = powerTrendWatts
+            }
 
             let totalNetworkBytes = processNetworkTotals[pid] ?? 0
             let previousNetworkBytes = previousProcessNetworkTotals[pid] ?? totalNetworkBytes
@@ -1489,11 +1502,11 @@ final class SystemMonitor: ObservableObject {
         }
 
         previousProcessCPUTime = newCPUCache
-        previousProcessRUsage = newRUsageCache
-        previousProcessEnergyNanojoules = newEnergyCache
-        previousProcessPackageIdleWakeups = newPackageWakeupCache
-        previousProcessInterruptWakeups = newInterruptWakeupCache
-        processPowerTrendWatts = nextPowerTrendWatts
+        previousProcessRUsage = newRUsageCache.filter { rowsByPID[$0.key] != nil }
+        previousProcessEnergyNanojoules = newEnergyCache.filter { rowsByPID[$0.key] != nil }
+        previousProcessPackageIdleWakeups = newPackageWakeupCache.filter { rowsByPID[$0.key] != nil }
+        previousProcessInterruptWakeups = newInterruptWakeupCache.filter { rowsByPID[$0.key] != nil }
+        processPowerTrendWatts = nextPowerTrendWatts.filter { rowsByPID[$0.key] != nil }
         previousProcessNetworkTotals = newNetworkCache
         processStaticMetadata = processStaticMetadata.filter { rowsByPID[$0.key] != nil }
 
@@ -2407,7 +2420,7 @@ extension SystemMonitor {
     }
 
     func processCPUSeconds(pid: Int32) -> Double {
-        guard let snapshot = processInfo(pid: pid) else { return 0 }
+        guard let snapshot = processInfo(pid: pid, includeResourceUsage: false) else { return 0 }
         return Double(snapshot.totalCPUTime) / 1_000_000_000
     }
 
@@ -3030,7 +3043,7 @@ extension SystemMonitor {
         return buffer.filter { $0 > 0 }
     }
 
-    func processInfo(pid: Int32) -> ProcessSnapshot? {
+    func processInfo(pid: Int32, includeResourceUsage: Bool) -> ProcessSnapshot? {
         var taskInfo = proc_taskinfo()
         let taskResult = proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &taskInfo, Int32(MemoryLayout<proc_taskinfo>.size))
         guard taskResult == Int32(MemoryLayout<proc_taskinfo>.size) else { return nil }
@@ -3040,10 +3053,15 @@ extension SystemMonitor {
         guard bsdResult == Int32(MemoryLayout<proc_bsdinfo>.size) else { return nil }
 
         var usage = rusage_info_current()
-        let usageResult = withUnsafeMutablePointer(to: &usage) { pointer in
-            pointer.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { rebound in
-                proc_pid_rusage(pid, RUSAGE_INFO_CURRENT, rebound)
+        let usageResult: Int32
+        if includeResourceUsage {
+            usageResult = withUnsafeMutablePointer(to: &usage) { pointer in
+                pointer.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { rebound in
+                    proc_pid_rusage(pid, RUSAGE_INFO_CURRENT, rebound)
+                }
             }
+        } else {
+            usageResult = -1
         }
 
         let startSeconds = Int64(bsdInfo.pbi_start_tvsec)
@@ -3168,7 +3186,7 @@ extension SystemMonitor {
         }
         let icon = NSWorkspace.shared.icon(forFile: iconPath)
         let thumbnail = resizedIcon(icon, sideLength: 16)
-        iconCache.setObject(thumbnail, forKey: key)
+        iconCache.setObject(thumbnail, forKey: key, cost: iconCacheCost(for: thumbnail))
         return thumbnail
     }
 
@@ -3197,6 +3215,13 @@ extension SystemMonitor {
                   fraction: 1)
         result.unlockFocus()
         return result
+    }
+
+    private func iconCacheCost(for icon: NSImage) -> Int {
+        let scale = NSScreen.main?.backingScaleFactor ?? 2
+        let pixelsWide = max(1, Int(icon.size.width * scale))
+        let pixelsHigh = max(1, Int(icon.size.height * scale))
+        return pixelsWide * pixelsHigh * 4
     }
 
     func networkInterfaces() -> [InterfaceSnapshot] {
@@ -3940,9 +3965,19 @@ extension SystemMonitor {
         if history.isEmpty {
             history = Array(repeating: 0, count: 60)
         }
-        history.append(value)
+        if history.count < 60 {
+            history.append(value)
+            return history
+        }
         if history.count > 60 {
-            history.removeFirst(history.count - 60)
+            history = Array(history.suffix(60))
+        }
+        history.withUnsafeMutableBufferPointer { buffer in
+            guard buffer.count == 60 else { return }
+            for index in 0..<59 {
+                buffer[index] = buffer[index + 1]
+            }
+            buffer[59] = value
         }
         return history
     }
@@ -4243,7 +4278,56 @@ private enum MonitorProbe {
         }
     }
 
+    private final class LaunchdPlistMetadataCache: @unchecked Sendable {
+        private struct Snapshot {
+            let uid: uid_t
+            let fingerprint: String
+            let metadata: [String: LaunchdPlistMetadataSnapshot]
+        }
+
+        private let lock = NSLock()
+        private var snapshot: Snapshot?
+
+        func metadata(uid: uid_t, directories: [String], loader: () -> [String: LaunchdPlistMetadataSnapshot]) -> [String: LaunchdPlistMetadataSnapshot] {
+            let fingerprint = Self.fingerprint(for: directories)
+            lock.lock()
+            if let snapshot, snapshot.uid == uid, snapshot.fingerprint == fingerprint {
+                let metadata = snapshot.metadata
+                lock.unlock()
+                return metadata
+            }
+            lock.unlock()
+
+            let metadata = loader()
+
+            lock.lock()
+            snapshot = Snapshot(uid: uid, fingerprint: fingerprint, metadata: metadata)
+            lock.unlock()
+            return metadata
+        }
+
+        private static func fingerprint(for directories: [String]) -> String {
+            let fileManager = FileManager.default
+            var parts: [String] = []
+            for directory in directories {
+                guard let entries = try? fileManager.contentsOfDirectory(atPath: directory) else {
+                    parts.append("\(directory)|missing")
+                    continue
+                }
+                for entry in entries where entry.hasSuffix(".plist") {
+                    let path = (directory as NSString).appendingPathComponent(entry)
+                    let attributes = (try? fileManager.attributesOfItem(atPath: path)) ?? [:]
+                    let modified = (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+                    let size = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
+                    parts.append("\(path)|\(modified)|\(size)")
+                }
+            }
+            return parts.sorted().joined(separator: "\n")
+        }
+    }
+
     private static let gpuProfilerCache = GPUProfilerCache()
+    private static let launchdPlistMetadataCache = LaunchdPlistMetadataCache()
 
     struct StaticProbeSnapshot {
         let rootWholeDiskID: String?
@@ -5280,7 +5364,12 @@ private enum MonitorProbe {
             "/Library/LaunchAgents",
             ("~/Library/LaunchAgents" as NSString).expandingTildeInPath
         ]
+        return launchdPlistMetadataCache.metadata(uid: uid, directories: directories) {
+            loadLaunchdPlistMetadata(uid: uid, directories: directories)
+        }
+    }
 
+    private static func loadLaunchdPlistMetadata(uid: uid_t, directories: [String]) -> [String: LaunchdPlistMetadataSnapshot] {
         let fileManager = FileManager.default
         var result: [String: LaunchdPlistMetadataSnapshot] = [:]
 
@@ -5473,9 +5562,19 @@ private enum MonitorProbe {
         if history.isEmpty {
             history = Array(repeating: 0, count: 60)
         }
-        history.append(value)
+        if history.count < 60 {
+            history.append(value)
+            return history
+        }
         if history.count > 60 {
-            history.removeFirst(history.count - 60)
+            history = Array(history.suffix(60))
+        }
+        history.withUnsafeMutableBufferPointer { buffer in
+            guard buffer.count == 60 else { return }
+            for index in 0..<59 {
+                buffer[index] = buffer[index + 1]
+            }
+            buffer[59] = value
         }
         return history
     }

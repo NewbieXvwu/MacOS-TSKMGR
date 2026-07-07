@@ -47,6 +47,7 @@ struct AppHistoryPageView: View {
     @State private var sortKey: AppHistorySortKey = .cpuTime
     @State private var ascending = false
     @State private var selectedRowID: String?
+    @State private var sortedRowsCache: [AppHistoryRowData] = []
 
     var body: some View {
         GeometryReader { proxy in
@@ -81,7 +82,8 @@ struct AppHistoryPageView: View {
 
                 ScrollView {
                     VStack(alignment: .leading, spacing: 0) {
-                        ForEach(Array(sortedRows.enumerated()), id: \.element.id) { index, row in
+                        ForEach(sortedRowsCache.indices, id: \.self) { index in
+                            let row = sortedRowsCache[index]
                             HStack(spacing: 0) {
                                 historyNameRowCell(row, width: widths.name)
                                 historyRowCell(row.cpuTime, width: widths.cpuTime, alignLeading: false)
@@ -111,11 +113,15 @@ struct AppHistoryPageView: View {
             .padding(.top, 18)
             .padding(.leading, AppHistoryColumnLayout.insetLeading)
             .padding(.trailing, AppHistoryColumnLayout.insetTrailing)
+            .onAppear(perform: updateSortedRows)
+            .onChange(of: monitor.appHistoryRows) { _, _ in updateSortedRows() }
+            .onChange(of: sortKey) { _, _ in updateSortedRows() }
+            .onChange(of: ascending) { _, _ in updateSortedRows() }
         }
     }
 
-    private var sortedRows: [AppHistoryRowData] {
-        monitor.appHistoryRows.sorted { lhs, rhs in
+    private func updateSortedRows() {
+        sortedRowsCache = monitor.appHistoryRows.sorted { lhs, rhs in
             let result: Bool
             switch sortKey {
             case .name:

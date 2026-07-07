@@ -572,7 +572,7 @@ enum NPUGraphKind: String, CaseIterable, Identifiable {
     }
 }
 
-struct ProcessRowData: Identifiable {
+struct ProcessRowData: Identifiable, Equatable {
     let pid: Int32
     let name: String
     let icon: NSImage?
@@ -594,6 +594,27 @@ struct ProcessRowData: Identifiable {
     let openFiles: Int
 
     var id: Int32 { pid }
+
+    static func == (lhs: ProcessRowData, rhs: ProcessRowData) -> Bool {
+        lhs.pid == rhs.pid
+            && lhs.name == rhs.name
+            && lhs.path == rhs.path
+            && lhs.isApp == rhs.isApp
+            && lhs.isParent == rhs.isParent
+            && lhs.parentPID == rhs.parentPID
+            && lhs.childCount == rhs.childCount
+            && lhs.cpuPercent == rhs.cpuPercent
+            && lhs.memoryBytes == rhs.memoryBytes
+            && lhs.diskBytesPerSecond == rhs.diskBytesPerSecond
+            && lhs.networkBytesPerSecond == rhs.networkBytesPerSecond
+            && lhs.networkText == rhs.networkText
+            && lhs.powerUsageWatts == rhs.powerUsageWatts
+            && lhs.powerTrendWatts == rhs.powerTrendWatts
+            && lhs.powerImpact == rhs.powerImpact
+            && lhs.trend == rhs.trend
+            && lhs.threadCount == rhs.threadCount
+            && lhs.openFiles == rhs.openFiles
+    }
 }
 
 enum ProcessSectionKind: String, CaseIterable, Identifiable, Hashable {
@@ -612,7 +633,7 @@ enum ProcessSectionKind: String, CaseIterable, Identifiable, Hashable {
     }
 }
 
-struct ProcessSectionData: Identifiable {
+struct ProcessSectionData: Identifiable, Equatable {
     let kind: ProcessSectionKind
     let rows: [ProcessRowData]
 
@@ -623,13 +644,17 @@ struct ProcessSectionData: Identifiable {
     }
 }
 
-struct UserPageSectionData: Identifiable {
+struct UserPageSectionData: Identifiable, Equatable {
     let id = UUID()
     let userName: String
     let rows: [ProcessRowData]
+
+    static func == (lhs: UserPageSectionData, rhs: UserPageSectionData) -> Bool {
+        lhs.userName == rhs.userName && lhs.rows == rhs.rows
+    }
 }
 
-struct AppHistoryRowData: Identifiable {
+struct AppHistoryRowData: Identifiable, Equatable {
     let id: String
     let name: String
     let icon: NSImage?
@@ -640,18 +665,38 @@ struct AppHistoryRowData: Identifiable {
     let networkBytes: UInt64
     let meteredNetwork: String
     let meteredNetworkBytes: UInt64
+
+    static func == (lhs: AppHistoryRowData, rhs: AppHistoryRowData) -> Bool {
+        lhs.id == rhs.id
+            && lhs.name == rhs.name
+            && lhs.path == rhs.path
+            && lhs.cpuTime == rhs.cpuTime
+            && lhs.cpuSeconds == rhs.cpuSeconds
+            && lhs.network == rhs.network
+            && lhs.networkBytes == rhs.networkBytes
+            && lhs.meteredNetwork == rhs.meteredNetwork
+            && lhs.meteredNetworkBytes == rhs.meteredNetworkBytes
+    }
 }
 
-struct StartupItemRowData: Identifiable {
+struct StartupItemRowData: Identifiable, Equatable {
     let id: String
     let name: String
     let icon: NSImage?
     let publisher: String
     let status: String
     let startupImpact: String
+
+    static func == (lhs: StartupItemRowData, rhs: StartupItemRowData) -> Bool {
+        lhs.id == rhs.id
+            && lhs.name == rhs.name
+            && lhs.publisher == rhs.publisher
+            && lhs.status == rhs.status
+            && lhs.startupImpact == rhs.startupImpact
+    }
 }
 
-struct ServiceRowData: Identifiable {
+struct ServiceRowData: Identifiable, Equatable {
     let id: String
     let name: String
     let icon: NSImage?
@@ -660,9 +705,19 @@ struct ServiceRowData: Identifiable {
     let status: String
     let group: String
     let label: String
+
+    static func == (lhs: ServiceRowData, rhs: ServiceRowData) -> Bool {
+        lhs.id == rhs.id
+            && lhs.name == rhs.name
+            && lhs.pid == rhs.pid
+            && lhs.serviceDescription == rhs.serviceDescription
+            && lhs.status == rhs.status
+            && lhs.group == rhs.group
+            && lhs.label == rhs.label
+    }
 }
 
-struct DetailProcessRowData: Identifiable {
+struct DetailProcessRowData: Identifiable, Equatable {
     let id: Int32
     let name: String
     let icon: NSImage?
@@ -672,6 +727,17 @@ struct DetailProcessRowData: Identifiable {
     let cpuPercent: Double
     let memoryBytes: UInt64
     let platform: String
+
+    static func == (lhs: DetailProcessRowData, rhs: DetailProcessRowData) -> Bool {
+        lhs.id == rhs.id
+            && lhs.name == rhs.name
+            && lhs.pid == rhs.pid
+            && lhs.status == rhs.status
+            && lhs.userName == rhs.userName
+            && lhs.cpuPercent == rhs.cpuPercent
+            && lhs.memoryBytes == rhs.memoryBytes
+            && lhs.platform == rhs.platform
+    }
 }
 
 enum AppleSiliconCoreTierMode {

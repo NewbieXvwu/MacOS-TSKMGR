@@ -1939,7 +1939,7 @@ struct RootWindowView: View {
         if let row = monitor.currentUserAppRows.first(where: { $0.pid == pid }) {
             return row
         }
-        if let info = monitor.processInfo(pid: pid) {
+        if let info = monitor.processInfo(pid: pid, includeResourceUsage: true) {
             return ProcessRowData(
                 pid: pid,
                 name: info.displayName,
@@ -3074,7 +3074,8 @@ struct NetworkDetailsView: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
-                    ForEach(Array(detailRows.enumerated()), id: \.offset) { index, row in
+                    ForEach(detailRows.indices, id: \.self) { index in
+                        let row = detailRows[index]
                         HStack(spacing: 0) {
                             detailCell(row.0, width: 240)
                             detailCell(row.1, width: 280)

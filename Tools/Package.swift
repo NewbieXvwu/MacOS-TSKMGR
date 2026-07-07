@@ -19,16 +19,38 @@ enum RuntimeAppPackagingDefaults {
 }
 
 let package = Package(
-    name: "MacOSTSKMGR",
+    name: "MacOSTSKMGRTools",
     platforms: [
         .macOS(.v26)
     ],
     products: [
-        .executable(name: "MacOSTSKMGR", targets: ["MacOSTSKMGR"])
+        .executable(name: "thermal_probe", targets: ["thermal_probe"]),
+        .library(name: "CPUFrequencyTierReference", targets: ["CPUFrequencyTierReference"])
     ],
     targets: [
         .executableTarget(
-            name: "MacOSTSKMGR"
+            name: "thermal_probe",
+            path: ".",
+            exclude: [
+                "Package.swift",
+                "ane_probe.swift",
+                "cpu_frequency_tier_reference.swift",
+                "package_swift_runtime_app.sh",
+                "set_version.sh"
+            ],
+            sources: ["thermal_probe.swift"]
+        ),
+        .target(
+            name: "CPUFrequencyTierReference",
+            path: ".",
+            exclude: [
+                "Package.swift",
+                "ane_probe.swift",
+                "package_swift_runtime_app.sh",
+                "set_version.sh",
+                "thermal_probe.swift"
+            ],
+            sources: ["cpu_frequency_tier_reference.swift"]
         )
     ]
 )

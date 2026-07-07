@@ -44,6 +44,7 @@ struct DetailsPageView: View {
     let onSetPriority: (Int32, ProcessPriorityPreset) -> Void
     @State private var sortKey: DetailsSortKey = .memory
     @State private var ascending = false
+    @State private var sortedRowsCache: [DetailProcessRowData] = []
 
     var body: some View {
         GeometryReader { proxy in
@@ -67,7 +68,8 @@ struct DetailsPageView: View {
 
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 0) {
-                        ForEach(Array(sortedRows.enumerated()), id: \.element.id) { index, row in
+                        ForEach(sortedRowsCache.indices, id: \.self) { index in
+                            let row = sortedRowsCache[index]
                             HStack(spacing: 0) {
                                 nameRowCell(row, width: widths.name)
                                 rowCell("\(row.pid)", width: widths.pid)
@@ -95,11 +97,15 @@ struct DetailsPageView: View {
             .padding(.top, 18)
             .padding(.leading, DetailsColumnLayout.insetLeading)
             .padding(.trailing, DetailsColumnLayout.insetTrailing)
+            .onAppear(perform: updateSortedRows)
+            .onChange(of: monitor.detailProcessRows) { _, _ in updateSortedRows() }
+            .onChange(of: sortKey) { _, _ in updateSortedRows() }
+            .onChange(of: ascending) { _, _ in updateSortedRows() }
         }
     }
 
-    private var sortedRows: [DetailProcessRowData] {
-        monitor.detailProcessRows.sorted { lhs, rhs in
+    private func updateSortedRows() {
+        sortedRowsCache = monitor.detailProcessRows.sorted { lhs, rhs in
             let result: Bool
             switch sortKey {
             case .name: result = lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
@@ -110,7 +116,7 @@ struct DetailsPageView: View {
             case .memory: result = lhs.memoryBytes < rhs.memoryBytes
             case .platform: result = lhs.platform.localizedStandardCompare(rhs.platform) == .orderedAscending
         }
-        return ascending ? result : !result
+            return ascending ? result : !result
         }
     }
 

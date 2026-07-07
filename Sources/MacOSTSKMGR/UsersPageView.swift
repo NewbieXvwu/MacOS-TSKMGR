@@ -42,11 +42,12 @@ struct UsersPageView: View {
     @State private var expanded = true
     @State private var sortKey: UsersSortKey = .memory
     @State private var ascending = false
+    @State private var sortedRowsCache: [ProcessRowData] = []
 
     var body: some View {
         GeometryReader { proxy in
             let widths = scaledWidths(for: proxy.size.width)
-            let rows = sortedRows
+            let rows = sortedRowsCache
             let userName = monitor.currentUserSection?.userName ?? NSFullUserName()
             let totalCPU = rows.reduce(0.0) { $0 + $1.cpuPercent }
             let totalMemory = rows.reduce(UInt64(0)) { $0 + $1.memoryBytes }
@@ -98,7 +99,8 @@ struct UsersPageView: View {
                         .background(AppTheme.rowEven(colorScheme))
 
                         if expanded {
-                            ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
+                            ForEach(rows.indices, id: \.self) { index in
+                                let row = rows[index]
                                 HStack(spacing: 0) {
                                     HStack(spacing: 8) {
                                         Color.clear.frame(width: 12, height: 12)
@@ -139,11 +141,15 @@ struct UsersPageView: View {
             .padding(.top, 18)
             .padding(.leading, UsersColumnLayout.insetLeading)
             .padding(.trailing, UsersColumnLayout.insetTrailing)
+            .onAppear(perform: updateSortedRows)
+            .onChange(of: monitor.currentUserAppRows) { _, _ in updateSortedRows() }
+            .onChange(of: sortKey) { _, _ in updateSortedRows() }
+            .onChange(of: ascending) { _, _ in updateSortedRows() }
         }
     }
 
-    private var sortedRows: [ProcessRowData] {
-        monitor.currentUserAppRows.sorted { lhs, rhs in
+    private func updateSortedRows() {
+        sortedRowsCache = monitor.currentUserAppRows.sorted { lhs, rhs in
             let result: Bool
             switch sortKey {
             case .user:

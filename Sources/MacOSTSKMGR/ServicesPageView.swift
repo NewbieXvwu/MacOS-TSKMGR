@@ -34,6 +34,7 @@ struct ServicesPageView: View {
     let onOpenDetailsTab: (Int32) -> Void
     @State private var sortKey: ServicesSortKey = .name
     @State private var ascending = true
+    @State private var sortedRowsCache: [ServiceRowData] = []
 
     var body: some View {
         GeometryReader { proxy in
@@ -55,7 +56,8 @@ struct ServicesPageView: View {
 
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 0) {
-                        ForEach(Array(sortedRows.enumerated()), id: \.element.id) { index, row in
+                        ForEach(sortedRowsCache.indices, id: \.self) { index in
+                            let row = sortedRowsCache[index]
                             HStack(spacing: 0) {
                                 nameRowCell(row, width: widths.name)
                                 rowCell(row.pid.map(String.init) ?? "", width: widths.pid)
@@ -82,13 +84,16 @@ struct ServicesPageView: View {
             .padding(.leading, ServicesColumnLayout.insetLeading)
             .padding(.trailing, ServicesColumnLayout.insetTrailing)
             .onAppear {
-                monitor.refreshServicesNow()
+                updateSortedRows()
             }
+            .onChange(of: monitor.serviceRows) { _, _ in updateSortedRows() }
+            .onChange(of: sortKey) { _, _ in updateSortedRows() }
+            .onChange(of: ascending) { _, _ in updateSortedRows() }
         }
     }
 
-    private var sortedRows: [ServiceRowData] {
-        monitor.serviceRows.sorted { lhs, rhs in
+    private func updateSortedRows() {
+        sortedRowsCache = monitor.serviceRows.sorted { lhs, rhs in
             let result: Bool
             switch sortKey {
             case .name:

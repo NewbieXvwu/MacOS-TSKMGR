@@ -27,6 +27,7 @@ struct StartupPageView: View {
     @State private var sortKey: StartupSortKey = .name
     @State private var ascending = true
     @State private var selectedRowID: String?
+    @State private var sortedRowsCache: [StartupItemRowData] = []
 
     var body: some View {
         GeometryReader { proxy in
@@ -56,7 +57,8 @@ struct StartupPageView: View {
 
                 ScrollView {
                     VStack(alignment: .leading, spacing: 0) {
-                        ForEach(Array(sortedRows.enumerated()), id: \.element.id) { index, row in
+                        ForEach(sortedRowsCache.indices, id: \.self) { index in
+                            let row = sortedRowsCache[index]
                             HStack(spacing: 0) {
                                 nameRowCell(row, width: widths.name)
                                 rowCell(language.localizeDirectoryLabel(row.publisher), width: widths.publisher, align: .leading)
@@ -98,11 +100,15 @@ struct StartupPageView: View {
             .padding(.top, 18)
             .padding(.leading, StartupColumnLayout.insetLeading)
             .padding(.trailing, StartupColumnLayout.insetTrailing)
+            .onAppear(perform: updateSortedRows)
+            .onChange(of: monitor.startupRows) { _, _ in updateSortedRows() }
+            .onChange(of: sortKey) { _, _ in updateSortedRows() }
+            .onChange(of: ascending) { _, _ in updateSortedRows() }
         }
     }
 
-    private var sortedRows: [StartupItemRowData] {
-        monitor.startupRows.sorted { lhs, rhs in
+    private func updateSortedRows() {
+        sortedRowsCache = monitor.startupRows.sorted { lhs, rhs in
             let result: Bool
             switch sortKey {
             case .name:

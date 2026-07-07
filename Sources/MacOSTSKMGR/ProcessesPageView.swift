@@ -48,6 +48,7 @@ struct ProcessesPageView: View {
     @Binding var sortKey: ProcessSortKey
     @Binding var ascending: Bool
     @State private var hoveredSortKey: ProcessSortKey?
+    @State private var sortedSectionsCache: [ProcessSectionData] = []
 
     var body: some View {
         GeometryReader { proxy in
@@ -59,11 +60,12 @@ struct ProcessesPageView: View {
 
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 0) {
-                        ForEach(sortedSections) { section in
+                        ForEach(sortedSectionsCache) { section in
                             sectionHeader(section, width: widths.total)
 
                             if !collapsedSections.contains(section.kind) {
-                                ForEach(Array(section.rows.enumerated()), id: \.element.id) { index, row in
+                                ForEach(section.rows.indices, id: \.self) { index in
+                                    let row = section.rows[index]
                                     processDataRow(row, rowIndex: index, widths: widths)
                                 }
                             }
@@ -76,11 +78,15 @@ struct ProcessesPageView: View {
             .padding(.top, 8)
             .padding(.leading, ProcessColumnLayout.pageInsetLeading)
             .padding(.trailing, ProcessColumnLayout.pageInsetTrailing)
+            .onAppear(perform: updateSortedSections)
+            .onChange(of: monitor.processSections) { _, _ in updateSortedSections() }
+            .onChange(of: sortKey) { _, _ in updateSortedSections() }
+            .onChange(of: ascending) { _, _ in updateSortedSections() }
         }
     }
 
-    private var sortedSections: [ProcessSectionData] {
-        monitor.processSections.map { section in
+    private func updateSortedSections() {
+        sortedSectionsCache = monitor.processSections.map { section in
             ProcessSectionData(kind: section.kind, rows: section.rows.sorted(by: compareRows))
         }
     }
