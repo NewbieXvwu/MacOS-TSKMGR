@@ -204,6 +204,7 @@ struct RootWindowView: View {
                 resizeWindowIfNeeded(animated: true)
             }
             .onChange(of: selectedPerf) { _, _ in
+                updateMonitorPresentation()
                 loadSelectedDiskDetailsIfNeeded()
             }
             .onChange(of: language) { _, newValue in
@@ -1050,7 +1051,7 @@ struct RootWindowView: View {
     }
 
     private func updateMonitorPresentation() {
-        monitor.setPresentation(tab: selectedTab, compactMode: compactMode)
+        monitor.setPresentation(tab: selectedTab, compactMode: compactMode, performanceSelection: selectedPerf)
     }
 
     private func loadSelectedDiskDetailsIfNeeded() {

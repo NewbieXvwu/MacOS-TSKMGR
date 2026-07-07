@@ -714,6 +714,7 @@ final class SystemMonitor: ObservableObject {
     private var servicesProbeTask: Task<Void, Never>?
     private var processSnapshotProbeTask: Task<Void, Never>?
     private var activeTab: TaskTab = .processes
+    private var activePerformanceSelection: PerfSelection = .cpu
     private var isCompactPresentation = true
     private var latestRowsByPID: [Int32: ProcessRowData] = [:]
     private var latestSnapshotsByPID: [Int32: ProcessSnapshot] = [:]
@@ -753,7 +754,6 @@ final class SystemMonitor: ObservableObject {
         self.pageSize = UInt64(pageSizeValue)
         bootstrapStaticInfo()
         rootWholeDiskID = MonitorProbe.rootWholeDiskIdentifierFromMountedRoot()
-        configureANEIOReportIfNeeded()
     }
 
     func start() {
@@ -936,11 +936,15 @@ final class SystemMonitor: ObservableObject {
         measured("refresh.networks") {
             refreshNetworks(interval: interval)
         }
-        measured("refresh.npus") {
-            refreshNPUs(ifNeededAt: now)
+        if shouldRefreshNPUState {
+            measured("refresh.npus") {
+                refreshNPUs(ifNeededAt: now, includeUsage: shouldSampleNPUUsage)
+            }
         }
-        measured("refresh.gpus") {
-            refreshGPUs(ifNeededAt: now)
+        if shouldRefreshGPUState {
+            measured("refresh.gpus") {
+                refreshGPUs(ifNeededAt: now)
+            }
         }
         measured("refresh.thermal") {
             refreshThermal(interval: interval)
@@ -1044,6 +1048,35 @@ final class SystemMonitor: ObservableObject {
         isCompactPresentation || activeTab == .processes || activeTab == .history || activeTab == .users
     }
 
+    private var shouldRefreshGPUState: Bool {
+        if gpus.isEmpty { return true }
+        return shouldSampleGPUUsage
+    }
+
+    private var shouldSampleGPUUsage: Bool {
+        if isCompactPresentation { return true }
+        guard activeTab == .performance else { return false }
+        if case .gpu = activePerformanceSelection { return true }
+        return false
+    }
+
+    private var shouldRefreshNPUState: Bool {
+        if cpuArchitecture == .intelLike { return false }
+        if aneInfoCache == nil { return true }
+        if isCompactPresentation { return true }
+        guard activeTab == .performance else { return false }
+        if case .npu = activePerformanceSelection { return true }
+        return false
+    }
+
+    private var shouldSampleNPUUsage: Bool {
+        if cpuArchitecture == .intelLike { return false }
+        if isCompactPresentation { return true }
+        guard activeTab == .performance else { return false }
+        if case .npu = activePerformanceSelection { return true }
+        return false
+    }
+
     private func rebuildVisibleProcessData() {
         if shouldBuildProcessSections {
             refreshProcessSections(rowsByPID: latestRowsByPID, visibleApps: latestVisibleApps)
@@ -1088,15 +1121,40 @@ final class SystemMonitor: ObservableObject {
         refreshDisks(interval: interval)
     }
 
-    func setPresentation(tab: TaskTab, compactMode: Bool) {
-        let changed = activeTab != tab || isCompactPresentation != compactMode
+    func setPresentation(tab: TaskTab, compactMode: Bool, performanceSelection: PerfSelection) {
+        let previousShouldSampleGPUUsage = shouldSampleGPUUsage
+        let previousShouldSampleNPUUsage = shouldSampleNPUUsage
+        let changed = activeTab != tab
+            || isCompactPresentation != compactMode
+            || activePerformanceSelection != performanceSelection
         activeTab = tab
         isCompactPresentation = compactMode
+        activePerformanceSelection = performanceSelection
         guard changed else { return }
         rebuildVisibleProcessData()
         requestSupplementalRefreshes(ifNeededAt: Date())
+        refreshNewlyVisibleAcceleratorState(
+            previousShouldSampleGPUUsage: previousShouldSampleGPUUsage,
+            previousShouldSampleNPUUsage: previousShouldSampleNPUUsage
+        )
         if hasStarted, !isTemporarilyPaused, shouldRefreshProcessPresentationImmediately() {
             refresh()
+        }
+    }
+
+    private func refreshNewlyVisibleAcceleratorState(
+        previousShouldSampleGPUUsage: Bool,
+        previousShouldSampleNPUUsage: Bool
+    ) {
+        guard hasStarted, !isTemporarilyPaused else { return }
+        let now = Date()
+        if shouldSampleGPUUsage, !previousShouldSampleGPUUsage {
+            lastGPUProbeDate = .distantPast
+            refreshGPUs(ifNeededAt: now)
+        }
+        if shouldSampleNPUUsage, !previousShouldSampleNPUUsage {
+            lastNPUUsageProbeDate = .distantPast
+            refreshNPUs(ifNeededAt: now, includeUsage: true)
         }
     }
 
@@ -1296,7 +1354,7 @@ final class SystemMonitor: ObservableObject {
         }
     }
 
-    private func scheduleNPURefresh(ifNeededAt now: Date, force: Bool = false) {
+    private func scheduleNPURefresh(ifNeededAt now: Date, force: Bool = false, includeUsage: Bool = true) {
         guard !isStopping else { return }
         guard cpuArchitecture != .intelLike else {
             npus = []
@@ -1312,7 +1370,17 @@ final class SystemMonitor: ObservableObject {
                     self.npuInfoProbeTask = nil
                     guard !self.isStopping else { return }
                     self.aneInfoCache = info
+                    if let info, self.npus.isEmpty {
+                        self.npus = [Self.placeholderNPUState(from: info)]
+                    }
                 }
+            }
+            return
+        }
+
+        guard includeUsage else {
+            if let aneInfo = aneInfoCache, npus.isEmpty {
+                npus = [Self.placeholderNPUState(from: aneInfo)]
             }
             return
         }
@@ -1325,6 +1393,7 @@ final class SystemMonitor: ObservableObject {
         let previousNPU = npus.first
         let totalMemory = memory.totalBytes
         let samplingDurationMilliseconds = max(UInt64((minimumInterval * 1000).rounded()), 500)
+        configureANEIOReportIfNeeded()
         let aneSampler = aneIOReportSampler
         lastNPUUsageProbeDate = now
         npuUsageProbeTask = Task.detached(priority: .utility) {
@@ -1346,6 +1415,37 @@ final class SystemMonitor: ObservableObject {
                 self.npus = nextNPU.map { [$0] } ?? []
             }
         }
+    }
+
+    private static func placeholderNPUState(from aneInfo: ANEDeviceInfo) -> NPUState {
+        let emptyHistory = Array(repeating: 0.0, count: 60)
+        return NPUState(
+            id: "npu0",
+            title: "NPU 0",
+            subtitle: aneInfo.modelName,
+            modelName: aneInfo.modelName,
+            npuCount: aneInfo.npuCount,
+            coreCount: aneInfo.coreCount,
+            architecture: aneInfo.architecture,
+            firmwareLoaded: aneInfo.firmwareLoaded,
+            currentPowerState: aneInfo.currentPowerState,
+            maxPowerState: aneInfo.maxPowerState,
+            activeClientCount: aneInfo.activeClientCount,
+            activeTimePercent: 0,
+            powerWatts: 0,
+            peakPowerWatts: 0,
+            dataReadBytesPerSecond: 0,
+            dataWriteBytesPerSecond: 0,
+            dataMovementBytesPerSecond: 0,
+            peakDataMovementBytesPerSecond: 0,
+            neuralFootprintBytes: 0,
+            peakNeuralFootprintBytes: 0,
+            historyActiveTime: emptyHistory,
+            historyPowerWatts: emptyHistory,
+            historyDataMovementBytes: emptyHistory,
+            historyFootprint: emptyHistory,
+            historyMemoryPressure: emptyHistory
+        )
     }
 
     private func scheduleStartupRefresh(ifNeededAt now: Date, force: Bool = false) {
@@ -2440,8 +2540,8 @@ final class SystemMonitor: ObservableObject {
         )
     }
 
-    private func refreshNPUs(ifNeededAt now: Date) {
-        scheduleNPURefresh(ifNeededAt: now, force: true)
+    private func refreshNPUs(ifNeededAt now: Date, includeUsage: Bool) {
+        scheduleNPURefresh(ifNeededAt: now, force: true, includeUsage: includeUsage)
     }
 
     private func cpuGridHistories() -> [[Double]] {
