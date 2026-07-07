@@ -30,6 +30,7 @@ struct GridChart: View {
     }
 
     var body: some View {
+        let points = normalized
         GeometryReader { proxy in
             ZStack {
                 let inset = max(contentInset, lineWidth / 2)
@@ -54,10 +55,10 @@ struct GridChart: View {
 
                 if filled {
                     Path { path in
-                        guard let first = normalized.first else { return }
+                        guard let first = points.first else { return }
                         path.move(to: CGPoint(x: inset, y: inset + chartHeight))
                         path.addLine(to: CGPoint(x: inset + first.x * chartWidth, y: inset + chartHeight * (1 - first.y)))
-                        for point in normalized {
+                        for point in points {
                             path.addLine(to: CGPoint(x: inset + point.x * chartWidth, y: inset + chartHeight * (1 - point.y)))
                         }
                         path.addLine(to: CGPoint(x: inset + chartWidth, y: inset + chartHeight))
@@ -67,9 +68,9 @@ struct GridChart: View {
                 }
 
                 Path { path in
-                    guard let first = normalized.first else { return }
+                    guard let first = points.first else { return }
                     path.move(to: CGPoint(x: inset + first.x * chartWidth, y: inset + chartHeight * (1 - first.y)))
-                    for point in normalized.dropFirst() {
+                    for point in points.dropFirst() {
                         path.addLine(to: CGPoint(x: inset + point.x * chartWidth, y: inset + chartHeight * (1 - point.y)))
                     }
                 }

@@ -113,6 +113,7 @@ struct RootWindowView: View {
                 monitor.language = language
                 monitor.temperatureUnit = temperatureUnit
                 updateDiskRefreshPolicy()
+                updateMonitorPresentation()
                 monitor.start()
                 normalizeKeyboardFocusArea()
                 updateWindowTrafficLights()
@@ -179,6 +180,7 @@ struct RootWindowView: View {
             .onChange(of: compactMode) { _, _ in
                 exitPerformanceSummaryIfNeeded()
                 updateDiskRefreshPolicy()
+                updateMonitorPresentation()
                 normalizeKeyboardFocusArea()
                 syncFinderBarCommandState()
                 updateFinderBarForCompactMode()
@@ -194,6 +196,7 @@ struct RootWindowView: View {
             .onChange(of: selectedTab) { _, _ in
                 exitPerformanceSummaryIfNeeded()
                 updateDiskRefreshPolicy()
+                updateMonitorPresentation()
                 loadSelectedDiskDetailsIfNeeded()
                 normalizeKeyboardFocusArea()
                 reconcileSelectionForCurrentTab()
@@ -1044,6 +1047,10 @@ struct RootWindowView: View {
 
     private func updateDiskRefreshPolicy() {
         monitor.setDiskRefreshEnabled(shouldRefreshDisksForCurrentPresentation)
+    }
+
+    private func updateMonitorPresentation() {
+        monitor.setPresentation(tab: selectedTab, compactMode: compactMode)
     }
 
     private func loadSelectedDiskDetailsIfNeeded() {
@@ -1936,7 +1943,7 @@ struct RootWindowView: View {
             return ProcessRowData(
                 pid: pid,
                 name: info.displayName,
-                icon: info.icon,
+                icon: monitor.iconForProcess(path: info.path),
                 path: info.path,
                 isApp: info.isApplication,
                 isParent: false,
