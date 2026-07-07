@@ -1658,6 +1658,30 @@ final class SystemMonitor: ObservableObject {
                 )
             }
 
+            if let snapshot = processInfo(pid: app.processIdentifier, includeResourceUsage: false) {
+                return ProcessRowData(
+                    pid: app.processIdentifier,
+                    name: app.localizedName ?? snapshot.displayName,
+                    iconPath: app.bundleURL?.path ?? snapshot.path,
+                    path: snapshot.path,
+                    isApp: true,
+                    isParent: false,
+                    parentPID: nil,
+                    childCount: 0,
+                    cpuPercent: 0,
+                    memoryBytes: snapshot.residentSize,
+                    diskBytesPerSecond: 0,
+                    networkBytesPerSecond: 0,
+                    networkText: "0 Mbps",
+                    powerUsageWatts: 0,
+                    powerTrendWatts: 0,
+                    powerImpact: DisplayFormat.impactLabel(powerUsageWatts: 0, wakeupsPerSecond: 0, language: language),
+                    trend: DisplayFormat.impactLabel(powerUsageWatts: 0, wakeupsPerSecond: 0, language: language),
+                    threadCount: snapshot.threadCount,
+                    openFiles: snapshot.openFiles
+                )
+            }
+
             return ProcessRowData(
                 pid: app.processIdentifier,
                 name: app.localizedName ?? app.bundleIdentifier ?? "未知应用",
