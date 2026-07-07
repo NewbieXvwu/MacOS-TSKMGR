@@ -4172,12 +4172,41 @@ extension Process {
 }
 
 private enum MonitorProbe {
-    private struct GPUProfilerSnapshot {
-        let date: Date
-        let items: [[String: Any]]
+    private final class GPUProfilerCache: @unchecked Sendable {
+        private struct Snapshot {
+            let date: Date
+            let items: [[String: Any]]
+        }
+
+        private let lock = NSLock()
+        private var snapshot: Snapshot?
+
+        func items(maxAge: TimeInterval = 60) -> [[String: Any]] {
+            lock.lock()
+            if let snapshot, Date().timeIntervalSince(snapshot.date) < maxAge {
+                let items = snapshot.items
+                lock.unlock()
+                return items
+            }
+            let fallback = snapshot?.items ?? []
+            lock.unlock()
+
+            guard
+                let profilerData = try? Process.runAndCapture("/usr/sbin/system_profiler", ["SPDisplaysDataType", "-json"]),
+                let profilerJSON = try? JSONSerialization.jsonObject(with: profilerData) as? [String: Any],
+                let profilerItems = profilerJSON["SPDisplaysDataType"] as? [[String: Any]]
+            else {
+                return fallback
+            }
+
+            lock.lock()
+            snapshot = Snapshot(date: Date(), items: profilerItems)
+            lock.unlock()
+            return profilerItems
+        }
     }
 
-    private static var gpuProfilerSnapshot: GPUProfilerSnapshot?
+    private static let gpuProfilerCache = GPUProfilerCache()
 
     struct StaticProbeSnapshot {
         let rootWholeDiskID: String?
@@ -4811,20 +4840,7 @@ private enum MonitorProbe {
     }
 
     static func cachedGPUProfilerItems(maxAge: TimeInterval = 60) -> [[String: Any]] {
-        if let snapshot = gpuProfilerSnapshot, Date().timeIntervalSince(snapshot.date) < maxAge {
-            return snapshot.items
-        }
-
-        guard
-            let profilerData = try? Process.runAndCapture("/usr/sbin/system_profiler", ["SPDisplaysDataType", "-json"]),
-            let profilerJSON = try? JSONSerialization.jsonObject(with: profilerData) as? [String: Any],
-            let profilerItems = profilerJSON["SPDisplaysDataType"] as? [[String: Any]]
-        else {
-            return gpuProfilerSnapshot?.items ?? []
-        }
-
-        gpuProfilerSnapshot = GPUProfilerSnapshot(date: Date(), items: profilerItems)
-        return profilerItems
+        gpuProfilerCache.items(maxAge: maxAge)
     }
 
     static func collectGPUStates(previous: [GPUState], language: AppLanguage, cpuArchitecture: CPUArchitecture) -> [GPUState] {
