@@ -143,21 +143,21 @@ struct FinderBarCustomMenuCommands: Commands {
                         }
                     }
                 }
-                Menu(commandState.language.text("菜单风格", "Menu style")) {
-                    ForEach(MenuVisualStyle.allCases) { style in
-                        Button {
-                            post(.setMenuVisualStyle, value: style.rawValue)
-                        } label: {
-                            checkmarkLabel(style.title(in: commandState.language), checked: commandState.menuVisualStyle == style)
-                        }
-                    }
-                }
                 Menu(commandState.language.text("温度单位", "Temperature unit")) {
                     ForEach(TemperatureUnit.allCases) { unit in
                         Button {
                             post(.setTemperatureUnit, value: unit.rawValue)
                         } label: {
                             checkmarkLabel(unit.title(in: commandState.language), checked: commandState.temperatureUnit == unit)
+                        }
+                    }
+                }
+                Menu(commandState.language.text("菜单风格", "Menu style")) {
+                    ForEach(MenuVisualStyle.allCases) { style in
+                        Button {
+                            post(.setMenuVisualStyle, value: style.rawValue)
+                        } label: {
+                            checkmarkLabel(style.title(in: commandState.language), checked: commandState.menuVisualStyle == style)
                         }
                     }
                 }

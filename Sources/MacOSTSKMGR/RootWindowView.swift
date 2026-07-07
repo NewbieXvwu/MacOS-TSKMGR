@@ -399,11 +399,26 @@ struct RootWindowView: View {
                 }
             }
 
-            if menuVisualStyle == .windowsNT, let activeMenu {
-                menuOverlay(for: activeMenu)
-                    .padding(.top, 56)
-                    .padding(.leading, menuXOffset(for: activeMenu))
-                    .zIndex(10)
+            if menuVisualStyle == .windowsNT, activeMenu != nil {
+                VStack(spacing: 0) {
+                    Color.clear
+                        .frame(height: 56)
+                        .allowsHitTesting(false)
+                    Color.clear
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            activeMenu = nil
+                        }
+                    }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .zIndex(9)
+
+                if let activeMenu {
+                    menuOverlay(for: activeMenu)
+                        .padding(.top, 56)
+                        .padding(.leading, menuXOffset(for: activeMenu))
+                        .zIndex(10)
+                }
             }
         }
     }
@@ -2262,6 +2277,15 @@ struct RootWindowView: View {
                 }
             }
         }
+        Menu(language.text("温度单位", "Temperature unit")) {
+            ForEach(TemperatureUnit.allCases) { unit in
+                Button {
+                    temperatureUnit = unit
+                } label: {
+                    nativeCheckmarkLabel(unit.title(in: language), checked: temperatureUnit == unit)
+                }
+            }
+        }
         Menu(language.text("菜单风格", "Menu style")) {
             ForEach(MenuVisualStyle.allCases) { style in
                 Button {
@@ -2269,18 +2293,6 @@ struct RootWindowView: View {
                 } label: {
                     nativeCheckmarkLabel(style.title(in: language), checked: menuVisualStyle == style)
                 }
-            }
-        }
-        Menu(language.text("温度单位", "Temperature unit")) {
-            Button {
-                temperatureUnit = .celsius
-            } label: {
-                nativeCheckmarkLabel(language.text("摄氏度 °C", "Celsius °C"), checked: temperatureUnit == .celsius)
-            }
-            Button {
-                temperatureUnit = .fahrenheit
-            } label: {
-                nativeCheckmarkLabel(language.text("华氏度 °F", "Fahrenheit °F"), checked: temperatureUnit == .fahrenheit)
             }
         }
     }
