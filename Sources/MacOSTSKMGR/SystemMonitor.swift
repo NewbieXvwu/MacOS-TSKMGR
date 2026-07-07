@@ -684,6 +684,7 @@ final class SystemMonitor: ObservableObject {
     private var latestSnapshotsByPID: [Int32: ProcessSnapshot] = [:]
     private var latestVisibleApps: [NSRunningApplication] = []
     private var lastProcessNetworkProbeDate: Date = .distantPast
+    private var lastMeteredProcessNetworkProbeDate: Date = .distantPast
     private var lastGPUProbeDate: Date = .distantPast
     private var lastNPUUsageProbeDate: Date = .distantPast
     private var lastStartupRefreshDate: Date = .distantPast
@@ -919,6 +920,10 @@ final class SystemMonitor: ObservableObject {
         activeTab == .details
     }
 
+    private var shouldCollectVisibleApps: Bool {
+        shouldBuildProcessSections || shouldBuildAppHistory || shouldBuildCurrentUserApps
+    }
+
     private var shouldRefreshStartupRows: Bool {
         activeTab == .startup || startupRows.isEmpty
     }
@@ -950,6 +955,7 @@ final class SystemMonitor: ObservableObject {
         lastServicesRefreshDate = .distantPast
         lastStartupRefreshDate = .distantPast
         lastProcessNetworkProbeDate = .distantPast
+        lastMeteredProcessNetworkProbeDate = .distantPast
         lastGPUProbeDate = .distantPast
         lastNPUUsageProbeDate = .distantPast
         refresh()
@@ -981,6 +987,19 @@ final class SystemMonitor: ObservableObject {
         guard changed else { return }
         rebuildVisibleProcessData()
         requestSupplementalRefreshes(ifNeededAt: Date())
+        if hasStarted, !isTemporarilyPaused, shouldRefreshProcessPresentationImmediately() {
+            refresh()
+        }
+    }
+
+    private func shouldRefreshProcessPresentationImmediately() -> Bool {
+        if shouldBuildDetailRows, latestSnapshotsByPID.isEmpty {
+            return true
+        }
+        if shouldCollectVisibleApps, latestVisibleApps.isEmpty {
+            return true
+        }
+        return false
     }
 
     func loadDetailedDiskMetadataIfNeeded(for selection: PerfSelection) {
@@ -1106,19 +1125,27 @@ final class SystemMonitor: ObservableObject {
     private func scheduleProcessNetworkProbe(ifNeededAt now: Date, force: Bool = false) {
         guard !isStopping else { return }
         guard processNetworkProbeTask == nil else { return }
-        guard force || shouldRefreshProcessNetworkTotals || processNetworkTotals.isEmpty else { return }
+        let shouldCollectMetered = shouldBuildAppHistory
+        guard force || shouldRefreshProcessNetworkTotals || processNetworkTotals.isEmpty || shouldCollectMetered else { return }
         let minimumInterval = max(refreshSpeed.interval ?? 1.0, 0.5)
-        guard force || processNetworkTotals.isEmpty || now.timeIntervalSince(lastProcessNetworkProbeDate) >= minimumInterval else { return }
+        let needsTotals = force || processNetworkTotals.isEmpty || now.timeIntervalSince(lastProcessNetworkProbeDate) >= minimumInterval
+        let needsMeteredTotals = shouldCollectMetered && (
+            force || meteredProcessNetworkTotals.isEmpty || now.timeIntervalSince(lastMeteredProcessNetworkProbeDate) >= minimumInterval
+        )
+        guard needsTotals || needsMeteredTotals else { return }
 
         lastProcessNetworkProbeDate = now
         processNetworkProbeTask = Task.detached(priority: .utility) {
             let totals = MonitorProbe.collectProcessNetworkSnapshot(interfaceFilter: nil)
-            let meteredTotals = MonitorProbe.collectProcessNetworkSnapshot(interfaceFilter: "expensive")
+            let meteredTotals = needsMeteredTotals ? MonitorProbe.collectProcessNetworkSnapshot(interfaceFilter: "expensive") : nil
             await MainActor.run {
                 self.processNetworkProbeTask = nil
                 guard !self.isStopping else { return }
                 self.processNetworkTotals = totals
-                self.meteredProcessNetworkTotals = meteredTotals
+                if let meteredTotals {
+                    self.lastMeteredProcessNetworkProbeDate = now
+                    self.meteredProcessNetworkTotals = meteredTotals
+                }
             }
         }
     }
@@ -1368,10 +1395,13 @@ final class SystemMonitor: ObservableObject {
     private func refreshProcesses(interval: TimeInterval) -> ProcessRefreshResult {
         let pids = listPIDs()
         let logicalCores = max(cpu.logicalCores, 1)
+        let shouldBuildSnapshots = shouldBuildDetailRows
         var rowsByPID: [Int32: ProcessRowData] = [:]
         rowsByPID.reserveCapacity(pids.count)
         var snapshotsByPID: [Int32: ProcessSnapshot] = [:]
-        snapshotsByPID.reserveCapacity(pids.count)
+        if shouldBuildSnapshots {
+            snapshotsByPID.reserveCapacity(pids.count)
+        }
 
         var newCPUCache: [Int32: UInt64] = [:]
         var newRUsageCache: [Int32: (UInt64, UInt64)] = [:]
@@ -1386,7 +1416,9 @@ final class SystemMonitor: ObservableObject {
 
         for pid in pids where pid > 0 {
             guard let info = processInfo(pid: pid) else { continue }
-            snapshotsByPID[pid] = info
+            if shouldBuildSnapshots {
+                snapshotsByPID[pid] = info
+            }
             totalThreadCount += info.threadCount
             totalOpenFilesCount += info.openFiles
 
@@ -1463,15 +1495,15 @@ final class SystemMonitor: ObservableObject {
         previousProcessInterruptWakeups = newInterruptWakeupCache
         processPowerTrendWatts = nextPowerTrendWatts
         previousProcessNetworkTotals = newNetworkCache
-        processStaticMetadata = processStaticMetadata.filter { snapshotsByPID[$0.key] != nil }
+        processStaticMetadata = processStaticMetadata.filter { rowsByPID[$0.key] != nil }
 
-        let visibleApps = frontWindowApplications()
+        let visibleApps = shouldCollectVisibleApps ? frontWindowApplications() : []
 
         return ProcessRefreshResult(
             rowsByPID: rowsByPID,
             snapshotsByPID: snapshotsByPID,
             visibleApps: visibleApps,
-            processCount: snapshotsByPID.count,
+            processCount: rowsByPID.count,
             threadCount: totalThreadCount,
             openFilesCount: totalOpenFilesCount
         )
@@ -4314,9 +4346,9 @@ private enum MonitorProbe {
             result[name, default: []].append(app.processIdentifier)
         }
 
-        let lines = text.components(separatedBy: .newlines).filter { !$0.isEmpty }
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
         guard let header = lines.first else { return result }
-        let columns = header.split(separator: ",", omittingEmptySubsequences: false).map(String.init)
+        let columns = header.split(separator: ",", omittingEmptySubsequences: false)
         guard
             let bytesInIndex = columns.firstIndex(of: "bytes_in"),
             let bytesOutIndex = columns.firstIndex(of: "bytes_out")
@@ -4325,7 +4357,7 @@ private enum MonitorProbe {
         }
 
         for line in lines.dropFirst() {
-            let parts = line.split(separator: ",", omittingEmptySubsequences: false).map(String.init)
+            let parts = line.split(separator: ",", omittingEmptySubsequences: false)
             guard parts.count > max(bytesInIndex, bytesOutIndex) else { continue }
 
             let processToken = parts[1]
@@ -4336,8 +4368,11 @@ private enum MonitorProbe {
             if let dotIndex = processToken.lastIndex(of: "."),
                let pid = Int32(processToken[processToken.index(after: dotIndex)...]) {
                 result[pid] = total
-            } else if let pids = pidsByName[processToken], pids.count == 1, let pid = pids.first {
-                result[pid] = total
+            } else {
+                let processName = String(processToken)
+                if let pids = pidsByName[processName], pids.count == 1, let pid = pids.first {
+                    result[pid] = total
+                }
             }
         }
         return result
