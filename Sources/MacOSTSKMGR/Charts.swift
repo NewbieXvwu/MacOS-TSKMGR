@@ -14,23 +14,22 @@ struct GridChart: View {
     var dash: [CGFloat] = []
     var contentInset: CGFloat = 0
 
-    private var normalized: [CGPoint] {
-        guard !values.isEmpty else { return [] }
-        let maxX = max(Double(values.count - 1), 1)
-        return values.enumerated().map { index, value in
-            let rawRatio = min(max(value / ceiling, 0), 1)
-            let liftedRatio: Double
-            if rawRatio <= 0 {
-                liftedRatio = 0
-            } else {
-                liftedRatio = minimumVisibleRatio + (1 - minimumVisibleRatio) * rawRatio
-            }
-            return CGPoint(x: Double(index) / maxX, y: min(max(liftedRatio, 0), 1))
+    private func normalizedY(_ value: Double) -> Double {
+        let rawRatio = min(max(value / ceiling, 0), 1)
+        if rawRatio <= 0 {
+            return 0
         }
+        return min(max(minimumVisibleRatio + (1 - minimumVisibleRatio) * rawRatio, 0), 1)
+    }
+
+    private func chartPoint(index: Int, value: Double, count: Int, width: CGFloat, height: CGFloat, inset: CGFloat) -> CGPoint {
+        let maxX = max(Double(count - 1), 1)
+        let x = inset + CGFloat(Double(index) / maxX) * width
+        let y = inset + height * CGFloat(1 - normalizedY(value))
+        return CGPoint(x: x, y: y)
     }
 
     var body: some View {
-        let points = normalized
         GeometryReader { proxy in
             ZStack {
                 let inset = max(contentInset, lineWidth / 2)
@@ -55,11 +54,12 @@ struct GridChart: View {
 
                 if filled {
                     Path { path in
-                        guard let first = points.first else { return }
+                        guard let firstValue = values.first else { return }
+                        let first = chartPoint(index: 0, value: firstValue, count: values.count, width: chartWidth, height: chartHeight, inset: inset)
                         path.move(to: CGPoint(x: inset, y: inset + chartHeight))
-                        path.addLine(to: CGPoint(x: inset + first.x * chartWidth, y: inset + chartHeight * (1 - first.y)))
-                        for point in points {
-                            path.addLine(to: CGPoint(x: inset + point.x * chartWidth, y: inset + chartHeight * (1 - point.y)))
+                        path.addLine(to: first)
+                        for (index, value) in values.enumerated() {
+                            path.addLine(to: chartPoint(index: index, value: value, count: values.count, width: chartWidth, height: chartHeight, inset: inset))
                         }
                         path.addLine(to: CGPoint(x: inset + chartWidth, y: inset + chartHeight))
                         path.closeSubpath()
@@ -68,10 +68,10 @@ struct GridChart: View {
                 }
 
                 Path { path in
-                    guard let first = points.first else { return }
-                    path.move(to: CGPoint(x: inset + first.x * chartWidth, y: inset + chartHeight * (1 - first.y)))
-                    for point in points.dropFirst() {
-                        path.addLine(to: CGPoint(x: inset + point.x * chartWidth, y: inset + chartHeight * (1 - point.y)))
+                    guard let firstValue = values.first else { return }
+                    path.move(to: chartPoint(index: 0, value: firstValue, count: values.count, width: chartWidth, height: chartHeight, inset: inset))
+                    for index in values.indices.dropFirst() {
+                        path.addLine(to: chartPoint(index: index, value: values[index], count: values.count, width: chartWidth, height: chartHeight, inset: inset))
                     }
                 }
                 .stroke(color, style: StrokeStyle(lineWidth: lineWidth, dash: dash))
@@ -93,19 +93,17 @@ struct DualLineGridChart: View {
     var primaryFilled: Bool = true
     var contentInset: CGFloat = 0
 
-    private func normalizedPoints(for values: [Double]) -> [CGPoint] {
-        guard !values.isEmpty else { return [] }
-        let maxX = max(Double(values.count - 1), 1)
-        return values.enumerated().map { index, value in
-            CGPoint(x: Double(index) / maxX, y: min(max(value / ceiling, 0), 1))
-        }
+    private func chartPoint(index: Int, value: Double, count: Int, width: CGFloat, height: CGFloat, inset: CGFloat) -> CGPoint {
+        let maxX = max(Double(count - 1), 1)
+        let ratio = min(max(value / ceiling, 0), 1)
+        return CGPoint(
+            x: inset + CGFloat(Double(index) / maxX) * width,
+            y: inset + height * CGFloat(1 - ratio)
+        )
     }
 
     var body: some View {
-        let primary = normalizedPoints(for: primaryValues)
-        let secondary = normalizedPoints(for: secondaryValues)
-
-        return GeometryReader { proxy in
+        GeometryReader { proxy in
             ZStack {
                 let inset = max(contentInset, lineWidth / 2)
                 let chartWidth = max(proxy.size.width - inset * 2, 0)
@@ -129,11 +127,12 @@ struct DualLineGridChart: View {
 
                 if primaryFilled {
                     Path { path in
-                        guard let first = primary.first else { return }
+                        guard let firstValue = primaryValues.first else { return }
+                        let first = chartPoint(index: 0, value: firstValue, count: primaryValues.count, width: chartWidth, height: chartHeight, inset: inset)
                         path.move(to: CGPoint(x: inset, y: inset + chartHeight))
-                        path.addLine(to: CGPoint(x: inset + first.x * chartWidth, y: inset + chartHeight * (1 - first.y)))
-                        for point in primary {
-                            path.addLine(to: CGPoint(x: inset + point.x * chartWidth, y: inset + chartHeight * (1 - point.y)))
+                        path.addLine(to: first)
+                        for (index, value) in primaryValues.enumerated() {
+                            path.addLine(to: chartPoint(index: index, value: value, count: primaryValues.count, width: chartWidth, height: chartHeight, inset: inset))
                         }
                         path.addLine(to: CGPoint(x: inset + chartWidth, y: inset + chartHeight))
                         path.closeSubpath()
@@ -142,19 +141,19 @@ struct DualLineGridChart: View {
                 }
 
                 Path { path in
-                    guard let first = primary.first else { return }
-                    path.move(to: CGPoint(x: inset + first.x * chartWidth, y: inset + chartHeight * (1 - first.y)))
-                    for point in primary.dropFirst() {
-                        path.addLine(to: CGPoint(x: inset + point.x * chartWidth, y: inset + chartHeight * (1 - point.y)))
+                    guard let firstValue = primaryValues.first else { return }
+                    path.move(to: chartPoint(index: 0, value: firstValue, count: primaryValues.count, width: chartWidth, height: chartHeight, inset: inset))
+                    for index in primaryValues.indices.dropFirst() {
+                        path.addLine(to: chartPoint(index: index, value: primaryValues[index], count: primaryValues.count, width: chartWidth, height: chartHeight, inset: inset))
                     }
                 }
                 .stroke(color, lineWidth: lineWidth)
 
                 Path { path in
-                    guard let first = secondary.first else { return }
-                    path.move(to: CGPoint(x: inset + first.x * chartWidth, y: inset + chartHeight * (1 - first.y)))
-                    for point in secondary.dropFirst() {
-                        path.addLine(to: CGPoint(x: inset + point.x * chartWidth, y: inset + chartHeight * (1 - point.y)))
+                    guard let firstValue = secondaryValues.first else { return }
+                    path.move(to: chartPoint(index: 0, value: firstValue, count: secondaryValues.count, width: chartWidth, height: chartHeight, inset: inset))
+                    for index in secondaryValues.indices.dropFirst() {
+                        path.addLine(to: chartPoint(index: index, value: secondaryValues[index], count: secondaryValues.count, width: chartWidth, height: chartHeight, inset: inset))
                     }
                 }
                 .stroke(color.opacity(0.75), style: StrokeStyle(lineWidth: lineWidth, dash: [4, 2]))

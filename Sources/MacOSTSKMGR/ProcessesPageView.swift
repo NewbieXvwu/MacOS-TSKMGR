@@ -64,8 +64,7 @@ struct ProcessesPageView: View {
                             sectionHeader(section, width: widths.total)
 
                             if !collapsedSections.contains(section.kind) {
-                                ForEach(section.rows.indices, id: \.self) { index in
-                                    let row = section.rows[index]
+                                ForEach(Array(section.rows.enumerated()), id: \.element.pid) { index, row in
                                     processDataRow(row, rowIndex: index, widths: widths)
                                 }
                             }
@@ -74,6 +73,7 @@ struct ProcessesPageView: View {
                     .frame(width: widths.total, alignment: .leading)
                     .padding(.bottom, 16)
                 }
+                .background(processPageBackground)
             }
             .padding(.top, 8)
             .padding(.leading, ProcessColumnLayout.pageInsetLeading)
@@ -83,6 +83,12 @@ struct ProcessesPageView: View {
             .onChange(of: sortKey) { _, _ in updateSortedSections() }
             .onChange(of: ascending) { _, _ in updateSortedSections() }
         }
+    }
+
+    private var processPageBackground: Color {
+        colorScheme == .dark
+            ? Color(red: 0.08, green: 0.10, blue: 0.14)
+            : Color(red: 0.76, green: 0.79, blue: 0.84)
     }
 
     private func updateSortedSections() {
@@ -246,7 +252,7 @@ struct ProcessesPageView: View {
     private func rowNameCell(_ row: ProcessRowData, width: CGFloat) -> some View {
         HStack(spacing: 8) {
             Color.clear.frame(width: 12, height: 12)
-            ProcessIconView(icon: row.icon)
+            ProcessIconView(iconPath: row.iconPath)
             Text(row.name)
                 .font(.system(size: 13))
                 .lineLimit(1)
@@ -506,10 +512,10 @@ struct ProcessScaledWidths {
 }
 
 struct ProcessIconView: View {
-    let icon: NSImage?
+    let iconPath: String
 
     var body: some View {
-        if let icon {
+        if let icon = ProcessIconCache.shared.icon(forPath: iconPath) {
             Image(nsImage: icon)
                 .resizable()
                 .interpolation(.high)

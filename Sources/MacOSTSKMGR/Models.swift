@@ -575,7 +575,7 @@ enum NPUGraphKind: String, CaseIterable, Identifiable {
 struct ProcessRowData: Identifiable, Equatable {
     let pid: Int32
     let name: String
-    let icon: NSImage?
+    let iconPath: String
     let path: String
     let isApp: Bool
     let isParent: Bool
@@ -657,7 +657,7 @@ struct UserPageSectionData: Identifiable, Equatable {
 struct AppHistoryRowData: Identifiable, Equatable {
     let id: String
     let name: String
-    let icon: NSImage?
+    let iconPath: String
     let path: String
     let cpuTime: String
     let cpuSeconds: Double
@@ -682,7 +682,7 @@ struct AppHistoryRowData: Identifiable, Equatable {
 struct StartupItemRowData: Identifiable, Equatable {
     let id: String
     let name: String
-    let icon: NSImage?
+    let iconPath: String
     let publisher: String
     let status: String
     let startupImpact: String
@@ -699,7 +699,7 @@ struct StartupItemRowData: Identifiable, Equatable {
 struct ServiceRowData: Identifiable, Equatable {
     let id: String
     let name: String
-    let icon: NSImage?
+    let iconPath: String
     let pid: Int32?
     let serviceDescription: String
     let status: String
@@ -720,7 +720,7 @@ struct ServiceRowData: Identifiable, Equatable {
 struct DetailProcessRowData: Identifiable, Equatable {
     let id: Int32
     let name: String
-    let icon: NSImage?
+    let iconPath: String
     let pid: Int32
     let status: String
     let userName: String
@@ -737,6 +737,76 @@ struct DetailProcessRowData: Identifiable, Equatable {
             && lhs.cpuPercent == rhs.cpuPercent
             && lhs.memoryBytes == rhs.memoryBytes
             && lhs.platform == rhs.platform
+    }
+}
+
+@MainActor
+final class ProcessIconCache {
+    static let shared = ProcessIconCache()
+
+    private let cache = NSCache<NSString, NSImage>()
+    private let lock = NSLock()
+
+    private init() {
+        cache.countLimit = 256
+        cache.totalCostLimit = 2 * 1024 * 1024
+    }
+
+    func removeAllObjects() {
+        cache.removeAllObjects()
+    }
+
+    func icon(forPath path: String) -> NSImage? {
+        guard let iconPath = resolvedIconPath(from: path) else { return nil }
+        let key = iconPath as NSString
+        if let cached = cache.object(forKey: key) {
+            return cached
+        }
+
+        lock.lock()
+        defer { lock.unlock() }
+        if let cached = cache.object(forKey: key) {
+            return cached
+        }
+
+        let icon = NSWorkspace.shared.icon(forFile: iconPath)
+        let thumbnail = resizedIcon(icon, sideLength: 16)
+        cache.setObject(thumbnail, forKey: key, cost: iconCacheCost(for: thumbnail))
+        return thumbnail
+    }
+
+    private func resolvedIconPath(from path: String) -> String? {
+        guard !path.isEmpty else { return nil }
+        if path.hasSuffix(".app") {
+            return path
+        }
+        let nsPath = path as NSString
+        let range = nsPath.range(of: ".app/")
+        if range.location != NSNotFound, let swiftRange = Range(range, in: path) {
+            let appPath = String(path[..<swiftRange.upperBound]).dropLast()
+            return String(appPath)
+        }
+        return path
+    }
+
+    private func resizedIcon(_ icon: NSImage, sideLength: CGFloat) -> NSImage {
+        let targetSize = NSSize(width: sideLength, height: sideLength)
+        let result = NSImage(size: targetSize)
+        result.lockFocus()
+        NSGraphicsContext.current?.imageInterpolation = .medium
+        icon.draw(in: NSRect(origin: .zero, size: targetSize),
+                  from: NSRect(origin: .zero, size: icon.size),
+                  operation: .copy,
+                  fraction: 1)
+        result.unlockFocus()
+        return result
+    }
+
+    private func iconCacheCost(for icon: NSImage) -> Int {
+        let scale = NSScreen.main?.backingScaleFactor ?? 2
+        let pixelsWide = max(1, Int(icon.size.width * scale))
+        let pixelsHigh = max(1, Int(icon.size.height * scale))
+        return pixelsWide * pixelsHigh * 4
     }
 }
 
@@ -980,21 +1050,11 @@ enum DisplayFormat {
     }
 
     static func bytes(_ bytes: UInt64) -> String {
-        let formatter = ByteCountFormatter()
-        formatter.allowedUnits = [.useKB, .useMB, .useGB, .useTB]
-        formatter.countStyle = .binary
-        formatter.includesUnit = true
-        formatter.isAdaptive = true
-        return formatter.string(fromByteCount: Int64(bytes))
+        scaledBytes(bytes, base: 1024, units: ["KB", "MB", "GB", "TB"])
     }
 
     static func decimalBytes(_ bytes: UInt64) -> String {
-        let formatter = ByteCountFormatter()
-        formatter.allowedUnits = [.useKB, .useMB, .useGB, .useTB]
-        formatter.countStyle = .decimal
-        formatter.includesUnit = true
-        formatter.isAdaptive = true
-        return formatter.string(fromByteCount: Int64(bytes))
+        scaledBytes(bytes, base: 1000, units: ["KB", "MB", "GB", "TB"])
     }
 
     static func memory(_ bytes: UInt64) -> String {
@@ -1034,6 +1094,20 @@ enum DisplayFormat {
             return String(format: "%.1f Kbps", kilobits)
         }
         return String(format: "%.2f Mbps", kilobits / 1000)
+    }
+
+    private static func scaledBytes(_ bytes: UInt64, base: Double, units: [String]) -> String {
+        guard bytes > 0 else { return "0 KB" }
+        var value = Double(bytes) / base
+        var unitIndex = 0
+        while value >= base, unitIndex < units.count - 1 {
+            value /= base
+            unitIndex += 1
+        }
+        if value >= 100 {
+            return String(format: "%.0f %@", value, units[unitIndex])
+        }
+        return String(format: "%.1f %@", value, units[unitIndex])
     }
 
     static func linkSpeed(bitsPerSecond: UInt64) -> String {

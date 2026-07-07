@@ -142,7 +142,7 @@ struct ServicesPageView: View {
 
     private func nameRowCell(_ row: ServiceRowData, width: CGFloat) -> some View {
         HStack(spacing: 8) {
-            ProcessIconView(icon: row.icon)
+            ProcessIconView(iconPath: row.iconPath)
             Text(row.name)
                 .font(.system(size: 13))
                 .lineLimit(1)

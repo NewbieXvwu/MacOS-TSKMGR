@@ -8,6 +8,7 @@ import IOKit
 import IOKit.storage
 import CoreFoundation
 import CoreWLAN
+import os.signpost
 
 @_silgen_name("CFRelease")
 private func CFReleaseShim(_ cf: CFTypeRef?)
@@ -274,21 +275,59 @@ private struct ANEIOReportChannelMetadata {
     let unit: String
 }
 
-private struct ANEIOReportDeltaSample {
-    let activeTimePercent: Double
-    let watts: Double
-    let dataReadBytesPerSecond: UInt64
-    let dataWriteBytesPerSecond: UInt64
-    let dataMovementBytesPerSecond: UInt64
-    let durationMilliseconds: UInt64
-}
-
 private struct ANEIOReportMetrics {
     let activeTimePercent: Double
     let watts: Double
     let dataReadBytesPerSecond: UInt64
     let dataWriteBytesPerSecond: UInt64
     let dataMovementBytesPerSecond: UInt64
+}
+
+private func fixedHistoryShift(_ values: [Double], adding value: Double) -> [Double] {
+    if values.count == 60 {
+        return Array(unsafeUninitializedCapacity: 60) { buffer, initializedCount in
+            for index in 0..<59 {
+                buffer[index] = values[index + 1]
+            }
+            buffer[59] = value
+            initializedCount = 60
+        }
+    }
+
+    if values.isEmpty {
+        return Array(unsafeUninitializedCapacity: 60) { buffer, initializedCount in
+            for index in 0..<59 {
+                buffer[index] = 0
+            }
+            buffer[59] = value
+            initializedCount = 60
+        }
+    }
+
+    if values.count < 60 {
+        return Array(unsafeUninitializedCapacity: 60) { buffer, initializedCount in
+            let padding = 60 - values.count - 1
+            if padding > 0 {
+                for index in 0..<padding {
+                    buffer[index] = 0
+                }
+            }
+            for index in values.indices {
+                buffer[padding + index] = values[index]
+            }
+            buffer[59] = value
+            initializedCount = 60
+        }
+    }
+
+    return Array(unsafeUninitializedCapacity: 60) { buffer, initializedCount in
+        let start = values.count - 59
+        for index in 0..<59 {
+            buffer[index] = values[start + index]
+        }
+        buffer[59] = value
+        initializedCount = 60
+    }
 }
 
 private final class ANEIOReportSampler: @unchecked Sendable {
@@ -389,8 +428,12 @@ private final class ANEIOReportSampler: @unchecked Sendable {
         }
         previousSample = nil
         let startedAt = previous.time
-        var samples: [ANEIOReportDeltaSample] = []
-        samples.reserveCapacity(requestedCount)
+        var totalWatts = 0.0
+        var totalActive = 0.0
+        var totalRead: UInt64 = 0
+        var totalWrite: UInt64 = 0
+        var totalMovement: UInt64 = 0
+        var sampleCount: UInt64 = 0
 
         for index in 1...requestedCount {
             let targetMilliseconds = durationMilliseconds * UInt64(index) / UInt64(requestedCount)
@@ -410,36 +453,28 @@ private final class ANEIOReportSampler: @unchecked Sendable {
             if let createSamplesDelta = IOReportRuntime.createSamplesDelta,
                let delta = createSamplesDelta(previous.sample, next.sample, nil)?.takeRetainedValue() {
                 let metrics = Self.extractANEMetrics(from: delta, metadata: metadata, durationMilliseconds: elapsedMilliseconds)
-                samples.append(ANEIOReportDeltaSample(
-                    activeTimePercent: metrics.activeTimePercent,
-                    watts: metrics.watts,
-                    dataReadBytesPerSecond: metrics.dataReadBytesPerSecond,
-                    dataWriteBytesPerSecond: metrics.dataWriteBytesPerSecond,
-                    dataMovementBytesPerSecond: metrics.dataMovementBytesPerSecond,
-                    durationMilliseconds: elapsedMilliseconds
-                ))
+                totalActive += metrics.activeTimePercent
+                totalWatts += metrics.watts
+                totalRead += metrics.dataReadBytesPerSecond
+                totalWrite += metrics.dataWriteBytesPerSecond
+                totalMovement += metrics.dataMovementBytesPerSecond
+                sampleCount += 1
             }
 
             previous = next
         }
 
         previousSample = previous
-        guard !samples.isEmpty else {
+        guard sampleCount > 0 else {
             return ANEIOReportMetrics(activeTimePercent: 0, watts: 0, dataReadBytesPerSecond: 0, dataWriteBytesPerSecond: 0, dataMovementBytesPerSecond: 0)
         }
 
-        let totalWatts = samples.reduce(0.0) { $0 + $1.watts }
-        let totalActive = samples.reduce(0.0) { $0 + $1.activeTimePercent }
-        let totalRead = samples.reduce(0) { $0 + UInt64($1.dataReadBytesPerSecond) }
-        let totalWrite = samples.reduce(0) { $0 + UInt64($1.dataWriteBytesPerSecond) }
-        let totalMovement = samples.reduce(0) { $0 + UInt64($1.dataMovementBytesPerSecond) }
-        let divisor = UInt64(samples.count)
         return ANEIOReportMetrics(
-            activeTimePercent: totalActive / Double(samples.count),
-            watts: totalWatts / Double(samples.count),
-            dataReadBytesPerSecond: totalRead / divisor,
-            dataWriteBytesPerSecond: totalWrite / divisor,
-            dataMovementBytesPerSecond: totalMovement / divisor
+            activeTimePercent: totalActive / Double(sampleCount),
+            watts: totalWatts / Double(sampleCount),
+            dataReadBytesPerSecond: totalRead / sampleCount,
+            dataWriteBytesPerSecond: totalWrite / sampleCount,
+            dataMovementBytesPerSecond: totalMovement / sampleCount
         )
     }
 
@@ -644,7 +679,6 @@ final class SystemMonitor: ObservableObject {
     private var previousNetworkCounters: [String: (in: UInt64, out: UInt64)] = [:]
     private var diskKindCache: [String: String] = [:]
     private var detailedDiskMetadataCache: [String: DiskDetailMetadata] = [:]
-    private let iconCache = NSCache<NSString, NSImage>()
     private var aneIOReportSampler: ANEIOReportSampler?
     private var lastSampleDate = Date()
     private let hostPort = mach_host_self()
@@ -678,10 +712,13 @@ final class SystemMonitor: ObservableObject {
     private var npuUsageProbeTask: Task<Void, Never>?
     private var startupProbeTask: Task<Void, Never>?
     private var servicesProbeTask: Task<Void, Never>?
+    private var processSnapshotProbeTask: Task<Void, Never>?
     private var activeTab: TaskTab = .processes
     private var isCompactPresentation = true
     private var latestRowsByPID: [Int32: ProcessRowData] = [:]
     private var latestSnapshotsByPID: [Int32: ProcessSnapshot] = [:]
+    private var latestProcessSnapshots: [ProcessSnapshot] = []
+    private var latestProcessSnapshotsIncludeResourceUsage = false
     private var latestVisibleApps: [NSRunningApplication] = []
     private var lastProcessNetworkProbeDate: Date = .distantPast
     private var lastMeteredProcessNetworkProbeDate: Date = .distantPast
@@ -690,6 +727,7 @@ final class SystemMonitor: ObservableObject {
     private var lastStartupRefreshDate: Date = .distantPast
     private var isStopping = false
     private var isDiskRefreshEnabled = false
+    private let refreshSignpostLog = OSLog(subsystem: "MacOSTSKMGR", category: "Refresh")
 
     private struct ProcessRefreshResult {
         let rowsByPID: [Int32: ProcessRowData]
@@ -713,8 +751,6 @@ final class SystemMonitor: ObservableObject {
         var pageSizeValue: vm_size_t = 0
         host_page_size(hostPort, &pageSizeValue)
         self.pageSize = UInt64(pageSizeValue)
-        iconCache.countLimit = 512
-        iconCache.totalCostLimit = 4 * 1024 * 1024
         bootstrapStaticInfo()
         rootWholeDiskID = MonitorProbe.rootWholeDiskIdentifierFromMountedRoot()
         configureANEIOReportIfNeeded()
@@ -734,7 +770,7 @@ final class SystemMonitor: ObservableObject {
         timer?.invalidate()
         timer = nil
         cancelSupplementalTasks()
-        iconCache.removeAllObjects()
+        ProcessIconCache.shared.removeAllObjects()
     }
 
     private func configureANEIOReportIfNeeded() {
@@ -875,26 +911,52 @@ final class SystemMonitor: ObservableObject {
     }
 
     private func refresh() {
+        measured("refresh.total") {
+            refreshImpl()
+        }
+    }
+
+    private func refreshImpl() {
         guard !isTemporarilyPaused else { return }
         let now = Date()
         let interval = max(now.timeIntervalSince(lastSampleDate), 0.4)
         lastSampleDate = now
 
-        refreshCPU(interval: interval)
-        refreshMemory()
-        if isDiskRefreshEnabled {
-            refreshDisks(interval: interval)
+        measured("refresh.cpu") {
+            refreshCPU(interval: interval)
         }
-        refreshNetworks(interval: interval)
-        refreshNPUs(ifNeededAt: now)
-        refreshGPUs(ifNeededAt: now)
-        refreshThermal(interval: interval)
-        let processRefresh = refreshProcesses(interval: interval)
+        measured("refresh.memory") {
+            refreshMemory()
+        }
+        if isDiskRefreshEnabled {
+            measured("refresh.disks") {
+                refreshDisks(interval: interval)
+            }
+        }
+        measured("refresh.networks") {
+            refreshNetworks(interval: interval)
+        }
+        measured("refresh.npus") {
+            refreshNPUs(ifNeededAt: now)
+        }
+        measured("refresh.gpus") {
+            refreshGPUs(ifNeededAt: now)
+        }
+        measured("refresh.thermal") {
+            refreshThermal(interval: interval)
+        }
+        let processRefresh = measured("refresh.processes") {
+            refreshProcesses(interval: interval)
+        }
         latestRowsByPID = processRefresh.rowsByPID
         latestSnapshotsByPID = processRefresh.snapshotsByPID
         latestVisibleApps = processRefresh.visibleApps
-        rebuildVisibleProcessData()
-        refreshStartupItems()
+        measured("refresh.presentation") {
+            rebuildVisibleProcessData()
+        }
+        measured("refresh.startup") {
+            refreshStartupItems()
+        }
 
         var nextCPU = cpu
         nextCPU.processCount = processRefresh.processCount
@@ -903,6 +965,47 @@ final class SystemMonitor: ObservableObject {
         nextCPU.uptimeText = DisplayFormat.uptime(ProcessInfo.processInfo.systemUptime)
         cpu = nextCPU
         requestSupplementalRefreshes(ifNeededAt: now)
+    }
+
+    private func measured<T>(_ name: StaticString, operation: () -> T) -> T {
+        let signpostID = OSSignpostID(log: refreshSignpostLog)
+        let started = DispatchTime.now().uptimeNanoseconds
+        let startingResident = currentResidentMemoryBytes()
+        os_signpost(.begin, log: refreshSignpostLog, name: name, signpostID: signpostID)
+        let result = operation()
+        let ended = DispatchTime.now().uptimeNanoseconds
+        let endingResident = currentResidentMemoryBytes()
+        let elapsedMilliseconds = Double(ended - started) / 1_000_000.0
+        let residentDelta = Int64(endingResident) - Int64(startingResident)
+        os_signpost(
+            .end,
+            log: refreshSignpostLog,
+            name: name,
+            signpostID: signpostID,
+            "duration_ms=%{public}.2f resident=%{public}llu delta=%{public}lld",
+            elapsedMilliseconds,
+            endingResident,
+            residentDelta
+        )
+        return result
+    }
+
+    private func currentResidentMemoryBytes() -> UInt64 {
+        var info = mach_task_basic_info()
+        var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size / MemoryLayout<natural_t>.size)
+        let result = withUnsafeMutablePointer(to: &info) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_(), task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return 0 }
+        return UInt64(info.resident_size)
+    }
+
+    private func assignIfChanged<Value: Equatable>(_ keyPath: ReferenceWritableKeyPath<SystemMonitor, Value>, _ value: Value) {
+        if self[keyPath: keyPath] != value {
+            self[keyPath: keyPath] = value
+        }
     }
 
     private var shouldBuildProcessSections: Bool {
@@ -1105,6 +1208,25 @@ final class SystemMonitor: ObservableObject {
         npuUsageProbeTask?.cancel()
         startupProbeTask?.cancel()
         servicesProbeTask?.cancel()
+        processSnapshotProbeTask?.cancel()
+    }
+
+    private func scheduleProcessSnapshotProbe(includeResourceUsage: Bool) {
+        guard !isStopping else { return }
+        guard processSnapshotProbeTask == nil else { return }
+        guard latestProcessSnapshots.isEmpty || latestProcessSnapshotsIncludeResourceUsage == includeResourceUsage || includeResourceUsage else {
+            return
+        }
+
+        processSnapshotProbeTask = Task.detached(priority: .userInitiated) {
+            let snapshots = MonitorProbe.collectProcessSnapshots(includeResourceUsage: includeResourceUsage)
+            await MainActor.run {
+                self.processSnapshotProbeTask = nil
+                guard !self.isStopping else { return }
+                self.latestProcessSnapshots = snapshots
+                self.latestProcessSnapshotsIncludeResourceUsage = includeResourceUsage
+            }
+        }
     }
 
     private func scheduleStaticProbeIfNeeded() {
@@ -1132,7 +1254,7 @@ final class SystemMonitor: ObservableObject {
         guard processNetworkProbeTask == nil else { return }
         let shouldCollectMetered = shouldBuildAppHistory
         guard force || shouldRefreshProcessNetworkTotals || processNetworkTotals.isEmpty || shouldCollectMetered else { return }
-        let minimumInterval = max(refreshSpeed.interval ?? 1.0, 0.5)
+        let minimumInterval = max(refreshSpeed.interval ?? 1.0, 3.0)
         let needsTotals = force || processNetworkTotals.isEmpty || now.timeIntervalSince(lastProcessNetworkProbeDate) >= minimumInterval
         let needsMeteredTotals = shouldCollectMetered && (
             force || meteredProcessNetworkTotals.isEmpty || now.timeIntervalSince(lastMeteredProcessNetworkProbeDate) >= minimumInterval
@@ -1240,19 +1362,20 @@ final class SystemMonitor: ObservableObject {
                 self.startupProbeTask = nil
                 guard !self.isStopping else { return }
                 self.disabledLaunchdByGroup = snapshot.disabledLaunchdByGroup
-                self.startupRows = snapshot.rows.map { row in
+                var nextRows = snapshot.rows.map { row in
                     StartupItemRowData(
                         id: row.id,
                         name: row.name,
-                        icon: row.iconProgramPath.flatMap { self.startupItemIcon(fromProgramPath: $0) },
+                        iconPath: row.iconProgramPath ?? "",
                         publisher: row.publisher,
                         status: row.status,
                         startupImpact: row.startupImpact
                     )
                 }
                 if self.language != language {
-                    self.startupRows = self.startupRows.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+                    nextRows = nextRows.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
                 }
+                self.assignIfChanged(\.startupRows, nextRows)
             }
         }
     }
@@ -1269,11 +1392,11 @@ final class SystemMonitor: ObservableObject {
             await MainActor.run {
                 self.servicesProbeTask = nil
                 guard !self.isStopping else { return }
-                self.serviceRows = snapshot.map { row in
+                let nextRows = snapshot.map { row in
                     ServiceRowData(
                         id: row.id,
                         name: row.name,
-                        icon: row.iconProgramPath.flatMap { self.startupItemIcon(fromProgramPath: $0) },
+                        iconPath: row.iconProgramPath ?? "",
                         pid: row.pid,
                         serviceDescription: row.serviceDescription,
                         status: row.status,
@@ -1281,6 +1404,7 @@ final class SystemMonitor: ObservableObject {
                         label: row.label
                     )
                 }
+                self.assignIfChanged(\.serviceRows, nextRows)
             }
         }
     }
@@ -1398,15 +1522,16 @@ final class SystemMonitor: ObservableObject {
     }
 
     private func refreshProcesses(interval: TimeInterval) -> ProcessRefreshResult {
-        let pids = listPIDs()
         let logicalCores = max(cpu.logicalCores, 1)
         let shouldBuildSnapshots = shouldBuildDetailRows
         let shouldSampleResourceUsage = shouldSampleProcessResourceUsage
+        scheduleProcessSnapshotProbe(includeResourceUsage: shouldSampleResourceUsage || shouldBuildSnapshots)
+        let snapshots = latestProcessSnapshots
         var rowsByPID: [Int32: ProcessRowData] = [:]
-        rowsByPID.reserveCapacity(pids.count)
+        rowsByPID.reserveCapacity(snapshots.count)
         var snapshotsByPID: [Int32: ProcessSnapshot] = [:]
         if shouldBuildSnapshots {
-            snapshotsByPID.reserveCapacity(pids.count)
+            snapshotsByPID.reserveCapacity(snapshots.count)
         }
 
         var newCPUCache: [Int32: UInt64] = [:]
@@ -1420,8 +1545,8 @@ final class SystemMonitor: ObservableObject {
         var totalThreadCount = 0
         var totalOpenFilesCount = 0
 
-        for pid in pids where pid > 0 {
-            guard let info = processInfo(pid: pid, includeResourceUsage: shouldSampleResourceUsage) else { continue }
+        for info in snapshots where info.pid > 0 {
+            let pid = info.pid
             if shouldBuildSnapshots {
                 snapshotsByPID[pid] = info
             }
@@ -1480,7 +1605,7 @@ final class SystemMonitor: ObservableObject {
             let row = ProcessRowData(
                 pid: pid,
                 name: info.displayName,
-                icon: nil,
+                iconPath: info.path,
                 path: info.path,
                 isApp: info.isApplication,
                 isParent: false,
@@ -1529,14 +1654,14 @@ final class SystemMonitor: ObservableObject {
                 return processRow(
                     row,
                     name: app.localizedName ?? row.name,
-                    icon: app.icon ?? iconForProcess(path: row.path)
+                    iconPath: app.bundleURL?.path ?? row.path
                 )
             }
 
             return ProcessRowData(
                 pid: app.processIdentifier,
                 name: app.localizedName ?? app.bundleIdentifier ?? "未知应用",
-                icon: app.icon,
+                iconPath: app.bundleURL?.path ?? "",
                 path: app.bundleURL?.path ?? "",
                 isApp: true,
                 isParent: false,
@@ -1556,25 +1681,53 @@ final class SystemMonitor: ObservableObject {
             )
         }
 
-        let background = rowsByPID.values
-            .filter { !visibleAppPIDs.contains($0.pid) }
-            .sorted(by: processRowSort)
-            .prefix(160)
-            .map { row in
-                processRow(row, icon: iconForProcess(path: row.path))
-            }
+        let background = topProcessRows(
+            rowsByPID.values.lazy.filter { !visibleAppPIDs.contains($0.pid) },
+            limit: 160,
+            by: processRowSort
+        )
+        .map { row in
+            processRow(row, iconPath: row.path)
+        }
 
-        processSections = [
+        let nextSections = [
             ProcessSectionData(kind: .apps, rows: appRows),
             ProcessSectionData(kind: .background, rows: Array(background))
         ]
+        assignIfChanged(\.processSections, nextSections)
     }
 
-    private func processRow(_ row: ProcessRowData, name: String? = nil, icon: NSImage?) -> ProcessRowData {
+    private func topProcessRows<S: Sequence>(_ rows: S, limit: Int, by areInIncreasingOrder: (ProcessRowData, ProcessRowData) -> Bool) -> [ProcessRowData] where S.Element == ProcessRowData {
+        guard limit > 0 else { return [] }
+        var selected: [ProcessRowData] = []
+        selected.reserveCapacity(limit)
+
+        for row in rows {
+            if selected.count < limit {
+                selected.append(row)
+                continue
+            }
+
+            var worstIndex = 0
+            for index in selected.indices.dropFirst() {
+                if areInIncreasingOrder(selected[worstIndex], selected[index]) {
+                    worstIndex = index
+                }
+            }
+
+            if areInIncreasingOrder(row, selected[worstIndex]) {
+                selected[worstIndex] = row
+            }
+        }
+
+        return selected.sorted(by: areInIncreasingOrder)
+    }
+
+    private func processRow(_ row: ProcessRowData, name: String? = nil, iconPath: String? = nil) -> ProcessRowData {
         ProcessRowData(
             pid: row.pid,
             name: name ?? row.name,
-            icon: icon,
+            iconPath: iconPath ?? row.iconPath,
             path: row.path,
             isApp: row.isApp,
             isParent: row.isParent,
@@ -1600,7 +1753,6 @@ final class SystemMonitor: ObservableObject {
         let historyRows: [AppHistoryRowData] = apps.map { app in
             let pid = app.processIdentifier
             let name = app.localizedName ?? app.bundleIdentifier ?? language.text("未知应用", "Unknown app")
-            let icon = app.icon
             let totalCPUSeconds = processCPUSeconds(pid: pid)
             let cpuSeconds = max(0, totalCPUSeconds - (appHistoryCPUBaseline[pid] ?? 0))
             let cpuTime = formatCPUTime(cpuSeconds)
@@ -1611,7 +1763,7 @@ final class SystemMonitor: ObservableObject {
             return AppHistoryRowData(
                 id: "\(pid)",
                 name: name,
-                icon: icon,
+                iconPath: app.bundleURL?.path ?? "",
                 path: app.bundleURL?.path ?? "",
                 cpuTime: cpuTime,
                 cpuSeconds: cpuSeconds,
@@ -1621,7 +1773,7 @@ final class SystemMonitor: ObservableObject {
                 meteredNetworkBytes: meteredNetworkBytes
             )
         }
-        appHistoryRows = historyRows
+        assignIfChanged(\.appHistoryRows, historyRows)
     }
 
     private func refreshCurrentUserApps(runningApps apps: [NSRunningApplication], processRowsByPID rowsByPID: [Int32: ProcessRowData]) {
@@ -1631,7 +1783,7 @@ final class SystemMonitor: ObservableObject {
             return ProcessRowData(
                 pid: row.pid,
                 name: app.localizedName ?? row.name,
-                icon: app.icon ?? iconForProcess(path: row.path),
+                iconPath: app.bundleURL?.path ?? row.iconPath,
                 path: row.path,
                 isApp: true,
                 isParent: false,
@@ -1650,17 +1802,17 @@ final class SystemMonitor: ObservableObject {
                 openFiles: row.openFiles
             )
         }
-        currentUserAppRows = rows
-        currentUserSection = UserPageSectionData(userName: NSFullUserName(), rows: rows)
+        assignIfChanged(\.currentUserAppRows, rows)
+        assignIfChanged(\.currentUserSection, Optional.some(UserPageSectionData(userName: NSFullUserName(), rows: rows)))
     }
 
     private func refreshDetailProcessRows(rowsByPID: [Int32: ProcessRowData], snapshotsByPID: [Int32: ProcessSnapshot]) {
-        detailProcessRows = snapshotsByPID.values.map { info in
+        let rows = snapshotsByPID.values.map { info in
             let cpu = rowsByPID[info.pid]?.cpuPercent ?? processCPUDisplayPercent(pid: info.pid, totalCPUTime: info.totalCPUTime)
             return DetailProcessRowData(
                 id: info.pid,
                 name: info.displayName,
-                icon: iconForProcess(path: info.path),
+                iconPath: info.path,
                 pid: info.pid,
                 status: processStatusText(info.bsdStatus),
                 userName: userName(for: info.uid),
@@ -1670,6 +1822,7 @@ final class SystemMonitor: ObservableObject {
             )
         }
         .sorted { $0.memoryBytes > $1.memoryBytes }
+        assignIfChanged(\.detailProcessRows, rows)
     }
 
     private func currentUserRunningApplications() -> [NSRunningApplication] {
@@ -2319,6 +2472,7 @@ extension SystemMonitor {
         let uid: uid_t
         let bsdStatus: UInt32
         let flags: UInt32
+        let parentPID: Int32
     }
 
     struct InterfaceSnapshot {
@@ -2379,7 +2533,7 @@ extension SystemMonitor {
     struct LaunchdPlistMetadata {
         let label: String
         let name: String
-        let icon: NSImage?
+        let iconProgramPath: String?
         let serviceDescription: String
         let group: String
         let disabled: Bool
@@ -2479,7 +2633,7 @@ extension SystemMonitor {
                     StartupItemRowData(
                         id: path,
                         name: name,
-                        icon: startupItemIcon(fromProgramPath: program),
+                        iconPath: program,
                         publisher: publisher,
                         status: enabled ? "Enabled" : "Disabled",
                         startupImpact: impact
@@ -2502,10 +2656,6 @@ extension SystemMonitor {
         MonitorProbe.directoryLabel(path)
     }
 
-    func startupItemIcon(fromProgramPath program: String) -> NSImage? {
-        iconForResolvedPath(program)
-    }
-
     func launchdRuntimeEntries(uid: uid_t) -> [LaunchdRuntimeEntry] {
         let systemEntries = parseLaunchctlPrintDomain("system", group: "system")
         let guiEntries = parseLaunchctlPrintDomain("gui/\(uid)", group: "gui/\(uid)")
@@ -2521,7 +2671,7 @@ extension SystemMonitor {
     }
 
     func parseLaunchctlPrintDomain(_ domain: String, group: String) -> [LaunchdRuntimeEntry] {
-        guard let data = try? Process.runAndCapture("/bin/launchctl", ["print", domain]),
+        guard let data = try? Process.runAndCapture("/bin/launchctl", ["print", domain], maxBytes: 4 * 1024 * 1024),
               let text = String(data: data, encoding: .utf8)
         else {
             return []
@@ -2607,7 +2757,7 @@ extension SystemMonitor {
                 result[key] = LaunchdPlistMetadata(
                     label: label,
                     name: name,
-                    icon: startupItemIcon(fromProgramPath: program),
+                    iconProgramPath: program.isEmpty ? nil : program,
                     serviceDescription: description,
                     group: group,
                     disabled: disabled
@@ -2690,7 +2840,7 @@ extension SystemMonitor {
         guard cpuArchitecture != .intelLike else {
             return nil
         }
-        guard let data = try? Process.runAndCapture("/usr/sbin/ioreg", ["-l", "-w0"]) else {
+        guard let data = try? Process.runAndCapture("/usr/sbin/ioreg", ["-l", "-w0"], maxBytes: 4 * 1024 * 1024) else {
             return nil
         }
         let text = String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
@@ -3003,11 +3153,9 @@ extension SystemMonitor {
 
     func childProcessesMap(allRows: [Int32: ProcessRowData]) -> [Int32: [Int32]] {
         var result: [Int32: [Int32]] = [:]
-        for pid in allRows.keys {
-            let children = listChildPIDs(parentPID: pid).filter { allRows[$0] != nil }
-            if !children.isEmpty {
-                result[pid] = children
-            }
+        for snapshot in latestProcessSnapshots {
+            guard allRows[snapshot.pid] != nil, allRows[snapshot.parentPID] != nil else { continue }
+            result[snapshot.parentPID, default: []].append(snapshot.pid)
         }
         return result
     }
@@ -3110,7 +3258,8 @@ extension SystemMonitor {
             isApplication: metadata.isApplication,
             uid: bsdInfo.pbi_uid,
             bsdStatus: bsdInfo.pbi_status,
-            flags: bsdInfo.pbi_flags
+            flags: bsdInfo.pbi_flags,
+            parentPID: Int32(bitPattern: bsdInfo.pbi_ppid)
         )
     }
 
@@ -3172,56 +3321,6 @@ extension SystemMonitor {
         let result = proc_pidpath(pid, &pathBuffer, UInt32(pathBuffer.count))
         guard result > 0 else { return "" }
         return stringFromCBuffer(pathBuffer)
-    }
-
-    func iconForProcess(path: String) -> NSImage? {
-        iconForResolvedPath(path)
-    }
-
-    private func iconForResolvedPath(_ path: String) -> NSImage? {
-        guard let iconPath = resolvedIconPath(from: path) else { return nil }
-        let key = iconPath as NSString
-        if let cached = iconCache.object(forKey: key) {
-            return cached
-        }
-        let icon = NSWorkspace.shared.icon(forFile: iconPath)
-        let thumbnail = resizedIcon(icon, sideLength: 16)
-        iconCache.setObject(thumbnail, forKey: key, cost: iconCacheCost(for: thumbnail))
-        return thumbnail
-    }
-
-    private func resolvedIconPath(from path: String) -> String? {
-        guard !path.isEmpty else { return nil }
-        if path.hasSuffix(".app") {
-            return path
-        }
-        let nsPath = path as NSString
-        let range = nsPath.range(of: ".app/")
-        if range.location != NSNotFound, let swiftRange = Range(range, in: path) {
-            let appPath = String(path[..<swiftRange.upperBound]).dropLast()
-            return String(appPath)
-        }
-        return path
-    }
-
-    private func resizedIcon(_ icon: NSImage, sideLength: CGFloat) -> NSImage {
-        let targetSize = NSSize(width: sideLength, height: sideLength)
-        let result = NSImage(size: targetSize)
-        result.lockFocus()
-        NSGraphicsContext.current?.imageInterpolation = .high
-        icon.draw(in: NSRect(origin: .zero, size: targetSize),
-                  from: NSRect(origin: .zero, size: icon.size),
-                  operation: .copy,
-                  fraction: 1)
-        result.unlockFocus()
-        return result
-    }
-
-    private func iconCacheCost(for icon: NSImage) -> Int {
-        let scale = NSScreen.main?.backingScaleFactor ?? 2
-        let pixelsWide = max(1, Int(icon.size.width * scale))
-        let pixelsHigh = max(1, Int(icon.size.height * scale))
-        return pixelsWide * pixelsHigh * 4
     }
 
     func networkInterfaces() -> [InterfaceSnapshot] {
@@ -3961,25 +4060,7 @@ extension SystemMonitor {
     }
 
     func shifted(_ values: [Double], adding value: Double) -> [Double] {
-        var history = values
-        if history.isEmpty {
-            history = Array(repeating: 0, count: 60)
-        }
-        if history.count < 60 {
-            history.append(value)
-            return history
-        }
-        if history.count > 60 {
-            history = Array(history.suffix(60))
-        }
-        history.withUnsafeMutableBufferPointer { buffer in
-            guard buffer.count == 60 else { return }
-            for index in 0..<59 {
-                buffer[index] = buffer[index + 1]
-            }
-            buffer[59] = value
-        }
-        return history
+        fixedHistoryShift(values, adding: value)
     }
 
     func percent(_ value: UInt64, _ total: UInt64) -> Double {
@@ -4229,7 +4310,7 @@ private extension Array {
 }
 
 extension Process {
-    static func runAndCapture(_ launchPath: String, _ arguments: [String]) throws -> Data {
+    static func runAndCapture(_ launchPath: String, _ arguments: [String], maxBytes: Int = 8 * 1024 * 1024) throws -> Data {
         let process = Process()
         let pipe = Pipe()
         process.executableURL = URL(fileURLWithPath: launchPath)
@@ -4237,13 +4318,172 @@ extension Process {
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
         try process.run()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        var data = Data()
+        while true {
+            let chunk = try pipe.fileHandleForReading.read(upToCount: 64 * 1024) ?? Data()
+            if chunk.isEmpty {
+                break
+            }
+            if data.count + chunk.count > maxBytes {
+                data.append(contentsOf: chunk.prefix(max(0, maxBytes - data.count)))
+                process.terminate()
+                break
+            }
+            data.append(chunk)
+        }
         process.waitUntilExit()
         return data
     }
 }
 
 private enum MonitorProbe {
+    private final class ProcessSnapshotSampler: @unchecked Sendable {
+        private struct StaticMetadata {
+            let startSeconds: Int64
+            let startMicroseconds: Int64
+            let displayName: String
+            let path: String
+            let isApplication: Bool
+            let processCPUType: cpu_type_t?
+        }
+
+        private let lock = NSLock()
+        private var metadataByPID: [Int32: StaticMetadata] = [:]
+        private let pidPathInfoMaxSize = 4 * Int(MAXPATHLEN)
+
+        func snapshots(includeResourceUsage: Bool) -> [SystemMonitor.ProcessSnapshot] {
+            lock.lock()
+            defer { lock.unlock() }
+
+            let pids = listPIDs()
+            var activePIDs = Set<Int32>()
+            activePIDs.reserveCapacity(pids.count)
+            var result: [SystemMonitor.ProcessSnapshot] = []
+            result.reserveCapacity(pids.count)
+
+            for pid in pids where pid > 0 {
+                activePIDs.insert(pid)
+                guard let snapshot = processInfo(pid: pid, includeResourceUsage: includeResourceUsage) else { continue }
+                result.append(snapshot)
+            }
+
+            metadataByPID = metadataByPID.filter { activePIDs.contains($0.key) }
+            return result
+        }
+
+        private func listPIDs() -> [Int32] {
+            let bufferSize = proc_listallpids(nil, 0)
+            guard bufferSize > 0 else { return [] }
+            let count = bufferSize / Int32(MemoryLayout<pid_t>.size)
+            var buffer = Array(repeating: pid_t(0), count: Int(count))
+            let bytes = proc_listallpids(&buffer, Int32(buffer.count * MemoryLayout<pid_t>.size))
+            guard bytes > 0 else { return [] }
+            return buffer.filter { $0 > 0 }
+        }
+
+        private func processInfo(pid: Int32, includeResourceUsage: Bool) -> SystemMonitor.ProcessSnapshot? {
+            var taskInfo = proc_taskinfo()
+            let taskResult = proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &taskInfo, Int32(MemoryLayout<proc_taskinfo>.size))
+            guard taskResult == Int32(MemoryLayout<proc_taskinfo>.size) else { return nil }
+
+            var bsdInfo = proc_bsdinfo()
+            let bsdResult = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bsdInfo, Int32(MemoryLayout<proc_bsdinfo>.size))
+            guard bsdResult == Int32(MemoryLayout<proc_bsdinfo>.size) else { return nil }
+
+            var usage = rusage_info_current()
+            let usageResult: Int32
+            if includeResourceUsage {
+                usageResult = withUnsafeMutablePointer(to: &usage) { pointer in
+                    pointer.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { rebound in
+                        proc_pid_rusage(pid, RUSAGE_INFO_CURRENT, rebound)
+                    }
+                }
+            } else {
+                usageResult = -1
+            }
+
+            let startSeconds = Int64(bsdInfo.pbi_start_tvsec)
+            let startMicroseconds = Int64(bsdInfo.pbi_start_tvusec)
+            let metadata: StaticMetadata
+            if let cached = metadataByPID[pid],
+               cached.startSeconds == startSeconds,
+               cached.startMicroseconds == startMicroseconds {
+                metadata = cached
+            } else {
+                var nameBuffer = Array(repeating: CChar(0), count: 256)
+                let named = proc_name(pid, &nameBuffer, UInt32(nameBuffer.count))
+                let command = named > 0 ? stringFromCBuffer(nameBuffer) : stringFromCArray(&bsdInfo.pbi_name.0)
+                let fallback = stringFromCArray(&bsdInfo.pbi_comm.0)
+                let displayName = command.isEmpty ? fallback : command
+                let path = pidPath(pid: pid)
+                var archInfo = proc_archinfo()
+                let archResult = proc_pidinfo(pid, PROC_PIDARCHINFO, 0, &archInfo, Int32(MemoryLayout<proc_archinfo>.size))
+                let processCPUType: cpu_type_t? = archResult == Int32(MemoryLayout<proc_archinfo>.size) ? archInfo.p_cputype : nil
+                let app = path.hasSuffix(".app") || path.contains("/Applications/") || path.contains("/System/Applications/")
+                metadata = StaticMetadata(
+                    startSeconds: startSeconds,
+                    startMicroseconds: startMicroseconds,
+                    displayName: displayName,
+                    path: path,
+                    isApplication: app,
+                    processCPUType: processCPUType
+                )
+                metadataByPID[pid] = metadata
+            }
+
+            return SystemMonitor.ProcessSnapshot(
+                pid: pid,
+                displayName: metadata.displayName,
+                path: metadata.path,
+                residentSize: taskInfo.pti_resident_size,
+                totalCPUTime: taskInfo.pti_total_user + taskInfo.pti_total_system,
+                diskReadBytes: usageResult == 0 ? usage.ri_diskio_bytesread : 0,
+                diskWriteBytes: usageResult == 0 ? usage.ri_diskio_byteswritten : 0,
+                energyNanojoules: usageResult == 0 ? usage.ri_energy_nj : 0,
+                packageIdleWakeups: usageResult == 0 ? usage.ri_pkg_idle_wkups : 0,
+                interruptWakeups: usageResult == 0 ? usage.ri_interrupt_wkups : 0,
+                processCPUType: metadata.processCPUType,
+                threadCount: Int(taskInfo.pti_threadnum),
+                openFiles: Int(bsdInfo.pbi_nfiles),
+                isApplication: metadata.isApplication,
+                uid: bsdInfo.pbi_uid,
+                bsdStatus: bsdInfo.pbi_status,
+                flags: bsdInfo.pbi_flags,
+                parentPID: Int32(bitPattern: bsdInfo.pbi_ppid)
+            )
+        }
+
+        private func pidPath(pid: Int32) -> String {
+            var pathBuffer = Array(repeating: CChar(0), count: pidPathInfoMaxSize)
+            let result = proc_pidpath(pid, &pathBuffer, UInt32(pathBuffer.count))
+            guard result > 0 else { return "" }
+            return stringFromCBuffer(pathBuffer)
+        }
+
+        private func stringFromCBuffer(_ buffer: [CChar]) -> String {
+            buffer.withUnsafeBufferPointer { pointer in
+                guard let baseAddress = pointer.baseAddress else { return "" }
+                return String(cString: baseAddress)
+            }
+        }
+
+        private func stringFromCArray(_ pointer: UnsafePointer<CChar>) -> String {
+            var bytes: [CChar] = []
+            for index in 0..<256 {
+                let value = pointer[index]
+                if value == 0 { break }
+                bytes.append(value)
+            }
+            return String(decoding: bytes.map { UInt8(bitPattern: $0) }, as: UTF8.self)
+        }
+    }
+
+    private static let processSnapshotSampler = ProcessSnapshotSampler()
+
+    static func collectProcessSnapshots(includeResourceUsage: Bool) -> [SystemMonitor.ProcessSnapshot] {
+        processSnapshotSampler.snapshots(includeResourceUsage: includeResourceUsage)
+    }
+
     private final class GPUProfilerCache: @unchecked Sendable {
         private struct Snapshot {
             let date: Date
@@ -4264,7 +4504,7 @@ private enum MonitorProbe {
             lock.unlock()
 
             guard
-                let profilerData = try? Process.runAndCapture("/usr/sbin/system_profiler", ["SPDisplaysDataType", "-json"]),
+                let profilerData = try? Process.runAndCapture("/usr/sbin/system_profiler", ["SPDisplaysDataType", "-json"], maxBytes: 2 * 1024 * 1024),
                 let profilerJSON = try? JSONSerialization.jsonObject(with: profilerData) as? [String: Any],
                 let profilerItems = profilerJSON["SPDisplaysDataType"] as? [[String: Any]]
             else {
@@ -4417,7 +4657,7 @@ private enum MonitorProbe {
         if let interfaceFilter {
             arguments.append(contentsOf: ["-t", interfaceFilter])
         }
-        guard let data = try? Process.runAndCapture("/usr/bin/nettop", arguments),
+        guard let data = try? Process.runAndCapture("/usr/bin/nettop", arguments, maxBytes: 2 * 1024 * 1024),
               let text = String(data: data, encoding: .utf8)
         else {
             return [:]
@@ -4706,7 +4946,7 @@ private enum MonitorProbe {
         guard cpuArchitecture != .intelLike else {
             return nil
         }
-        guard let data = try? Process.runAndCapture("/usr/sbin/ioreg", ["-l", "-w0"]) else {
+        guard let data = try? Process.runAndCapture("/usr/sbin/ioreg", ["-r", "-d", "1", "-c", "H11ANE", "-l", "-w0"], maxBytes: 1024 * 1024) else {
             return nil
         }
         let text = String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
@@ -4969,7 +5209,7 @@ private enum MonitorProbe {
 
     static func collectGPUStates(previous: [GPUState], language: AppLanguage, cpuArchitecture: CPUArchitecture) -> [GPUState] {
         guard
-            let acceleratorData = try? Process.runAndCapture("/usr/sbin/ioreg", ["-r", "-d", "1", "-c", "IOAccelerator", "-a", "-l"]),
+            let acceleratorData = try? Process.runAndCapture("/usr/sbin/ioreg", ["-r", "-d", "1", "-c", "IOAccelerator", "-a", "-l"], maxBytes: 4 * 1024 * 1024),
             let acceleratorArray = try? PropertyListSerialization.propertyList(from: acceleratorData, options: [], format: nil) as? [[String: Any]]
         else {
             return previous
@@ -5276,7 +5516,7 @@ private enum MonitorProbe {
     }
 
     static func disabledLaunchdLabels(domain: String) -> Set<String> {
-        guard let data = try? Process.runAndCapture("/bin/launchctl", ["print-disabled", domain]),
+        guard let data = try? Process.runAndCapture("/bin/launchctl", ["print-disabled", domain], maxBytes: 1024 * 1024),
               let text = String(data: data, encoding: .utf8)
         else {
             return []
@@ -5308,7 +5548,7 @@ private enum MonitorProbe {
     }
 
     static func parseLaunchctlPrintDomain(_ domain: String, group: String) -> [SystemMonitor.LaunchdRuntimeEntry] {
-        guard let data = try? Process.runAndCapture("/bin/launchctl", ["print", domain]),
+        guard let data = try? Process.runAndCapture("/bin/launchctl", ["print", domain], maxBytes: 4 * 1024 * 1024),
               let text = String(data: data, encoding: .utf8)
         else {
             return []
@@ -5558,25 +5798,7 @@ private enum MonitorProbe {
     }
 
     static func shifted(_ values: [Double], adding value: Double) -> [Double] {
-        var history = values
-        if history.isEmpty {
-            history = Array(repeating: 0, count: 60)
-        }
-        if history.count < 60 {
-            history.append(value)
-            return history
-        }
-        if history.count > 60 {
-            history = Array(history.suffix(60))
-        }
-        history.withUnsafeMutableBufferPointer { buffer in
-            guard buffer.count == 60 else { return }
-            for index in 0..<59 {
-                buffer[index] = buffer[index + 1]
-            }
-            buffer[59] = value
-        }
-        return history
+        fixedHistoryShift(values, adding: value)
     }
 
     static func metalLabel(from raw: String) -> String {

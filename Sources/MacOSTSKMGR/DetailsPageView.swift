@@ -151,7 +151,7 @@ struct DetailsPageView: View {
 
     private func nameRowCell(_ row: DetailProcessRowData, width: CGFloat) -> some View {
         HStack(spacing: 8) {
-            ProcessIconView(icon: row.icon)
+            ProcessIconView(iconPath: row.iconPath)
             Text(row.name)
                 .font(.system(size: 13))
                 .lineLimit(1)
@@ -255,7 +255,7 @@ struct DetailsPageView: View {
         return ProcessRowData(
             pid: row.pid,
             name: row.name,
-            icon: row.icon,
+            iconPath: row.iconPath,
             path: path,
             isApp: path.hasSuffix(".app") || path.contains("/Applications/") || path.contains("/System/Applications/"),
             isParent: false,

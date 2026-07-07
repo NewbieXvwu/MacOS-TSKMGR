@@ -104,7 +104,7 @@ struct UsersPageView: View {
                                 HStack(spacing: 0) {
                                     HStack(spacing: 8) {
                                         Color.clear.frame(width: 12, height: 12)
-                                        ProcessIconView(icon: row.icon)
+                                        ProcessIconView(iconPath: row.iconPath)
                                         Text(row.name)
                                             .font(.system(size: 13))
                                             .lineLimit(1)

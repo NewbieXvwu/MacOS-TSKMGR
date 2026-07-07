@@ -1943,7 +1943,7 @@ struct RootWindowView: View {
             return ProcessRowData(
                 pid: pid,
                 name: info.displayName,
-                icon: monitor.iconForProcess(path: info.path),
+                iconPath: info.path,
                 path: info.path,
                 isApp: info.isApplication,
                 isParent: false,
@@ -2568,7 +2568,7 @@ struct CompactApplicationsView: View {
                 LazyVStack(spacing: 0) {
                     ForEach(rows) { row in
                         HStack(spacing: 10) {
-                            ProcessIconView(icon: row.icon)
+                            ProcessIconView(iconPath: row.iconPath)
                             Text(row.name)
                                 .font(.system(size: 14))
                                 .lineLimit(1)
