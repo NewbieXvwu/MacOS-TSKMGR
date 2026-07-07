@@ -297,6 +297,7 @@ private final class ANEIOReportSampler: @unchecked Sendable {
     private let metadata: [ANEIOReportChannelMetadata]
     private let sourceChannels: CFDictionary
     private let selectedChannels: CFMutableArray?
+    private let lock = NSLock()
     private var previousSample: (sample: CFDictionary, time: DispatchTime)?
 
     init?() {
@@ -369,11 +370,15 @@ private final class ANEIOReportSampler: @unchecked Sendable {
     }
 
     func warmUp() {
+        lock.lock()
+        defer { lock.unlock() }
         guard previousSample == nil else { return }
         previousSample = rawSample()
     }
 
     func sampleMetrics(durationMilliseconds: UInt64, count: Int) -> ANEIOReportMetrics {
+        lock.lock()
+        defer { lock.unlock() }
         let requestedCount = max(1, min(count, 16))
         if previousSample == nil {
             previousSample = rawSample()
