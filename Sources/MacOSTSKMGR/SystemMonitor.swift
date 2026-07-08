@@ -1842,6 +1842,9 @@ final class SystemMonitor: ObservableObject {
         guard limit > 0 else { return [] }
 
         // Min-heap using areInIncreasingOrder: the "worst" (smallest) element stays at root
+        func isWorseThan(_ lhs: ProcessRowData, _ rhs: ProcessRowData) -> Bool {
+            areInIncreasingOrder(rhs, lhs)
+        }
         var heap: [ProcessRowData] = []
         heap.reserveCapacity(limit)
 
@@ -1851,7 +1854,7 @@ final class SystemMonitor: ObservableObject {
                 var child = heap.count - 1
                 while child > 0 {
                     let parent = (child - 1) / 2
-                    if areInIncreasingOrder(heap[child], heap[parent]) {
+                    if isWorseThan(heap[child], heap[parent]) {
                         heap.swapAt(child, parent)
                         child = parent
                     } else {
@@ -1870,10 +1873,10 @@ final class SystemMonitor: ObservableObject {
                     let left = 2 * parent + 1
                     let right = left + 1
                     var smallest = parent
-                    if left < count && areInIncreasingOrder(heap[left], heap[smallest]) {
+                    if left < count && isWorseThan(heap[left], heap[smallest]) {
                         smallest = left
                     }
-                    if right < count && areInIncreasingOrder(heap[right], heap[smallest]) {
+                    if right < count && isWorseThan(heap[right], heap[smallest]) {
                         smallest = right
                     }
                     if smallest != parent {
