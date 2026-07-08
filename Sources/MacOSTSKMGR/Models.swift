@@ -598,6 +598,7 @@ struct ProcessRowData: Identifiable, Equatable {
     static func == (lhs: ProcessRowData, rhs: ProcessRowData) -> Bool {
         lhs.pid == rhs.pid
             && lhs.name == rhs.name
+            && lhs.iconPath == rhs.iconPath
             && lhs.path == rhs.path
             && lhs.isApp == rhs.isApp
             && lhs.isParent == rhs.isParent
@@ -740,9 +741,8 @@ struct DetailProcessRowData: Identifiable, Equatable {
     }
 }
 
-@MainActor
 final class ProcessIconCache {
-    static let shared = ProcessIconCache()
+    nonisolated(unsafe) static let shared = ProcessIconCache()
 
     private let cache = NSCache<NSString, NSImage>()
     private let lock = NSLock()

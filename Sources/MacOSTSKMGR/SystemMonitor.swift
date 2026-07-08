@@ -685,7 +685,6 @@ final class SystemMonitor: ObservableObject {
     private let pageSize: UInt64
     private let hostCPULoadInfoCount = mach_msg_type_number_t(MemoryLayout<host_cpu_load_info_data_t>.size / MemoryLayout<integer_t>.size)
     private let hostVMInfo64Count = mach_msg_type_number_t(MemoryLayout<vm_statistics64_data_t>.size / MemoryLayout<integer_t>.size)
-    private let pidPathInfoMaxSize = 4 * Int(MAXPATHLEN)
     private var cpuArchitecture = CPUArchitecture.unknown
     private var appleCachePairs: [InfoPair] = []
     private var legacyCachePairs: [InfoPair] = []
@@ -721,6 +720,9 @@ final class SystemMonitor: ObservableObject {
     private var latestProcessSnapshots: [ProcessSnapshot] = []
     private var latestProcessSnapshotsIncludeResourceUsage = false
     private var latestVisibleApps: [NSRunningApplication] = []
+    private(set) var dataVersion: UInt64 = 0
+    private var startupDirty = true
+    private var servicesDirty = true
     private var lastProcessNetworkProbeDate: Date = .distantPast
     private var lastMeteredProcessNetworkProbeDate: Date = .distantPast
     private var lastGPUProbeDate: Date = .distantPast
@@ -739,7 +741,7 @@ final class SystemMonitor: ObservableObject {
         let openFilesCount: Int
     }
 
-    private struct ProcessStaticMetadata {
+    struct ProcessStaticMetadata {
         let startSeconds: Int64
         let startMicroseconds: Int64
         let displayName: String
@@ -961,6 +963,7 @@ final class SystemMonitor: ObservableObject {
         measured("refresh.startup") {
             refreshStartupItems()
         }
+        dataVersion &+= 1
 
         var nextCPU = cpu
         nextCPU.processCount = processRefresh.processCount
@@ -971,6 +974,7 @@ final class SystemMonitor: ObservableObject {
         requestSupplementalRefreshes(ifNeededAt: now)
     }
 
+    #if DEBUG
     private func measured<T>(_ name: StaticString, operation: () -> T) -> T {
         let signpostID = OSSignpostID(log: refreshSignpostLog)
         let started = DispatchTime.now().uptimeNanoseconds
@@ -1005,11 +1009,20 @@ final class SystemMonitor: ObservableObject {
         guard result == KERN_SUCCESS else { return 0 }
         return UInt64(info.resident_size)
     }
+    #else
+    @inline(__always)
+    private func measured<T>(_ name: StaticString, operation: () -> T) -> T {
+        operation()
+    }
+    #endif
 
-    private func assignIfChanged<Value: Equatable>(_ keyPath: ReferenceWritableKeyPath<SystemMonitor, Value>, _ value: Value) {
+    @discardableResult
+    private func assignIfChanged<Value: Equatable>(_ keyPath: ReferenceWritableKeyPath<SystemMonitor, Value>, _ value: Value) -> Bool {
         if self[keyPath: keyPath] != value {
             self[keyPath: keyPath] = value
+            return true
         }
+        return false
     }
 
     private var shouldBuildProcessSections: Bool {
@@ -1475,7 +1488,9 @@ final class SystemMonitor: ObservableObject {
                 if self.language != language {
                     nextRows = nextRows.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
                 }
-                self.assignIfChanged(\.startupRows, nextRows)
+                if self.assignIfChanged(\.startupRows, nextRows) {
+                    self.dataVersion &+= 1
+                }
             }
         }
     }
@@ -1504,7 +1519,9 @@ final class SystemMonitor: ObservableObject {
                         label: row.label
                     )
                 }
-                self.assignIfChanged(\.serviceRows, nextRows)
+                if self.assignIfChanged(\.serviceRows, nextRows) {
+                    self.dataVersion &+= 1
+                }
             }
         }
     }
@@ -1823,28 +1840,53 @@ final class SystemMonitor: ObservableObject {
 
     private func topProcessRows<S: Sequence>(_ rows: S, limit: Int, by areInIncreasingOrder: (ProcessRowData, ProcessRowData) -> Bool) -> [ProcessRowData] where S.Element == ProcessRowData {
         guard limit > 0 else { return [] }
-        var selected: [ProcessRowData] = []
-        selected.reserveCapacity(limit)
+
+        // Min-heap using areInIncreasingOrder: the "worst" (smallest) element stays at root
+        var heap: [ProcessRowData] = []
+        heap.reserveCapacity(limit)
 
         for row in rows {
-            if selected.count < limit {
-                selected.append(row)
+            if heap.count < limit {
+                heap.append(row)
+                var child = heap.count - 1
+                while child > 0 {
+                    let parent = (child - 1) / 2
+                    if areInIncreasingOrder(heap[child], heap[parent]) {
+                        heap.swapAt(child, parent)
+                        child = parent
+                    } else {
+                        break
+                    }
+                }
                 continue
             }
 
-            var worstIndex = 0
-            for index in selected.indices.dropFirst() {
-                if areInIncreasingOrder(selected[worstIndex], selected[index]) {
-                    worstIndex = index
+            // If row is better than the heap root (worst of the top-k), replace it
+            if areInIncreasingOrder(row, heap[0]) {
+                heap[0] = row
+                var parent = 0
+                let count = heap.count
+                while true {
+                    let left = 2 * parent + 1
+                    let right = left + 1
+                    var smallest = parent
+                    if left < count && areInIncreasingOrder(heap[left], heap[smallest]) {
+                        smallest = left
+                    }
+                    if right < count && areInIncreasingOrder(heap[right], heap[smallest]) {
+                        smallest = right
+                    }
+                    if smallest != parent {
+                        heap.swapAt(parent, smallest)
+                        parent = smallest
+                    } else {
+                        break
+                    }
                 }
-            }
-
-            if areInIncreasingOrder(row, selected[worstIndex]) {
-                selected[worstIndex] = row
             }
         }
 
-        return selected.sorted(by: areInIncreasingOrder)
+        return heap.sorted(by: areInIncreasingOrder)
     }
 
     private func processRow(_ row: ProcessRowData, name: String? = nil, iconPath: String? = nil) -> ProcessRowData {
@@ -3344,12 +3386,12 @@ extension SystemMonitor {
            cached.startMicroseconds == startMicroseconds {
             metadata = cached
         } else {
-            var nameBuffer = Array(repeating: CChar(0), count: 256)
+            var nameBuffer = Array(repeating: CChar(0), count: Int(MAXPATHLEN))
             let named = proc_name(pid, &nameBuffer, UInt32(nameBuffer.count))
-            let command = named > 0 ? stringFromCBuffer(nameBuffer) : stringFromCArray(&bsdInfo.pbi_name.0)
-            let fallback = stringFromCArray(&bsdInfo.pbi_comm.0)
+            let command = named > 0 ? Self.stringFromCBuffer(nameBuffer) : Self.stringFromCArray(&bsdInfo.pbi_name.0)
+            let fallback = Self.stringFromCArray(&bsdInfo.pbi_comm.0)
             let displayName = command.isEmpty ? fallback : command
-            let path = pidPath(pid: pid)
+            let path = Self.pidPath(pid: pid)
             var archInfo = proc_archinfo()
             let archResult = proc_pidinfo(pid, PROC_PIDARCHINFO, 0, &archInfo, Int32(MemoryLayout<proc_archinfo>.size))
             let processCPUType: cpu_type_t? = archResult == Int32(MemoryLayout<proc_archinfo>.size) ? archInfo.p_cputype : nil
@@ -3440,11 +3482,11 @@ extension SystemMonitor {
         }
     }
 
-    func pidPath(pid: Int32) -> String {
-        var pathBuffer = Array(repeating: CChar(0), count: pidPathInfoMaxSize)
+    nonisolated static func pidPath(pid: Int32) -> String {
+        var pathBuffer = Array(repeating: CChar(0), count: 4 * Int(MAXPATHLEN))
         let result = proc_pidpath(pid, &pathBuffer, UInt32(pathBuffer.count))
         guard result > 0 else { return "" }
-        return stringFromCBuffer(pathBuffer)
+        return Self.stringFromCBuffer(pathBuffer)
     }
 
     func networkInterfaces() -> [InterfaceSnapshot] {
@@ -3473,7 +3515,7 @@ extension SystemMonitor {
                         let length = socklen_t(addr.pointee.sa_len)
                         let result = getnameinfo(addr, length, &hostBuffer, socklen_t(hostBuffer.count), nil, 0, NI_NUMERICHOST)
                         if result == 0 {
-                            let text = stringFromCBuffer(hostBuffer)
+                            let text = Self.stringFromCBuffer(hostBuffer)
                             if family == UInt8(AF_INET) {
                                 ipv4Map[name] = text
                             } else if !text.hasPrefix("fe80") {
@@ -4053,7 +4095,7 @@ extension SystemMonitor {
     func ioRegistryName(_ entry: io_registry_entry_t) -> String {
         var name = [CChar](repeating: 0, count: 128)
         guard IORegistryEntryGetName(entry, &name) == KERN_SUCCESS else { return "" }
-        return stringFromCBuffer(name)
+        return Self.stringFromCBuffer(name)
     }
 
     func detectRootWholeDiskIdentifier() -> String? {
@@ -4173,7 +4215,7 @@ extension SystemMonitor {
         guard sysctlbyname(name, nil, &size, nil, 0) == 0 else { return nil }
         var buffer = Array<CChar>(repeating: 0, count: size)
         guard sysctlbyname(name, &buffer, &size, nil, 0) == 0 else { return nil }
-        return stringFromCBuffer(buffer)
+        return Self.stringFromCBuffer(buffer)
     }
 
     func sysctlInt(_ name: String) -> UInt64? {
@@ -4410,12 +4452,12 @@ extension SystemMonitor {
         }
     }
 
-    func stringFromCBuffer(_ buffer: [CChar]) -> String {
+    nonisolated static func stringFromCBuffer(_ buffer: [CChar]) -> String {
         let prefix = buffer.prefix { $0 != 0 }
         return String(decoding: prefix.map { UInt8(bitPattern: $0) }, as: UTF8.self)
     }
 
-    func stringFromCArray(_ pointer: UnsafePointer<CChar>) -> String {
+    nonisolated static func stringFromCArray(_ pointer: UnsafePointer<CChar>) -> String {
         String(cString: pointer)
     }
 }
@@ -4462,18 +4504,8 @@ extension Process {
 
 private enum MonitorProbe {
     private final class ProcessSnapshotSampler: @unchecked Sendable {
-        private struct StaticMetadata {
-            let startSeconds: Int64
-            let startMicroseconds: Int64
-            let displayName: String
-            let path: String
-            let isApplication: Bool
-            let processCPUType: cpu_type_t?
-        }
-
         private let lock = NSLock()
-        private var metadataByPID: [Int32: StaticMetadata] = [:]
-        private let pidPathInfoMaxSize = 4 * Int(MAXPATHLEN)
+        private var metadataByPID: [Int32: SystemMonitor.ProcessStaticMetadata] = [:]
 
         func snapshots(includeResourceUsage: Bool) -> [SystemMonitor.ProcessSnapshot] {
             lock.lock()
@@ -4528,23 +4560,23 @@ private enum MonitorProbe {
 
             let startSeconds = Int64(bsdInfo.pbi_start_tvsec)
             let startMicroseconds = Int64(bsdInfo.pbi_start_tvusec)
-            let metadata: StaticMetadata
+            let metadata: SystemMonitor.ProcessStaticMetadata
             if let cached = metadataByPID[pid],
                cached.startSeconds == startSeconds,
                cached.startMicroseconds == startMicroseconds {
                 metadata = cached
             } else {
-                var nameBuffer = Array(repeating: CChar(0), count: 256)
+                var nameBuffer = Array(repeating: CChar(0), count: Int(MAXPATHLEN))
                 let named = proc_name(pid, &nameBuffer, UInt32(nameBuffer.count))
-                let command = named > 0 ? stringFromCBuffer(nameBuffer) : stringFromCArray(&bsdInfo.pbi_name.0)
-                let fallback = stringFromCArray(&bsdInfo.pbi_comm.0)
+                let command = named > 0 ? SystemMonitor.stringFromCBuffer(nameBuffer) : SystemMonitor.stringFromCArray(&bsdInfo.pbi_name.0)
+                let fallback = SystemMonitor.stringFromCArray(&bsdInfo.pbi_comm.0)
                 let displayName = command.isEmpty ? fallback : command
-                let path = pidPath(pid: pid)
+                let path = SystemMonitor.pidPath(pid: pid)
                 var archInfo = proc_archinfo()
                 let archResult = proc_pidinfo(pid, PROC_PIDARCHINFO, 0, &archInfo, Int32(MemoryLayout<proc_archinfo>.size))
                 let processCPUType: cpu_type_t? = archResult == Int32(MemoryLayout<proc_archinfo>.size) ? archInfo.p_cputype : nil
                 let app = path.hasSuffix(".app") || path.contains("/Applications/") || path.contains("/System/Applications/")
-                metadata = StaticMetadata(
+                metadata = SystemMonitor.ProcessStaticMetadata(
                     startSeconds: startSeconds,
                     startMicroseconds: startMicroseconds,
                     displayName: displayName,
@@ -4577,29 +4609,6 @@ private enum MonitorProbe {
             )
         }
 
-        private func pidPath(pid: Int32) -> String {
-            var pathBuffer = Array(repeating: CChar(0), count: pidPathInfoMaxSize)
-            let result = proc_pidpath(pid, &pathBuffer, UInt32(pathBuffer.count))
-            guard result > 0 else { return "" }
-            return stringFromCBuffer(pathBuffer)
-        }
-
-        private func stringFromCBuffer(_ buffer: [CChar]) -> String {
-            buffer.withUnsafeBufferPointer { pointer in
-                guard let baseAddress = pointer.baseAddress else { return "" }
-                return String(cString: baseAddress)
-            }
-        }
-
-        private func stringFromCArray(_ pointer: UnsafePointer<CChar>) -> String {
-            var bytes: [CChar] = []
-            for index in 0..<256 {
-                let value = pointer[index]
-                if value == 0 { break }
-                bytes.append(value)
-            }
-            return String(decoding: bytes.map { UInt8(bitPattern: $0) }, as: UTF8.self)
-        }
     }
 
     private static let processSnapshotSampler = ProcessSnapshotSampler()

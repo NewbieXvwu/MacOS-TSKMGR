@@ -101,7 +101,7 @@ struct StartupPageView: View {
             .padding(.leading, StartupColumnLayout.insetLeading)
             .padding(.trailing, StartupColumnLayout.insetTrailing)
             .onAppear(perform: updateSortedRows)
-            .onChange(of: monitor.startupRows) { _, _ in updateSortedRows() }
+            .onChange(of: monitor.dataVersion) { _, _ in updateSortedRows() }
             .onChange(of: sortKey) { _, _ in updateSortedRows() }
             .onChange(of: ascending) { _, _ in updateSortedRows() }
         }

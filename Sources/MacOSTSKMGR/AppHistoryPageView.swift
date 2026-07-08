@@ -114,7 +114,7 @@ struct AppHistoryPageView: View {
             .padding(.leading, AppHistoryColumnLayout.insetLeading)
             .padding(.trailing, AppHistoryColumnLayout.insetTrailing)
             .onAppear(perform: updateSortedRows)
-            .onChange(of: monitor.appHistoryRows) { _, _ in updateSortedRows() }
+            .onChange(of: monitor.dataVersion) { _, _ in updateSortedRows() }
             .onChange(of: sortKey) { _, _ in updateSortedRows() }
             .onChange(of: ascending) { _, _ in updateSortedRows() }
         }

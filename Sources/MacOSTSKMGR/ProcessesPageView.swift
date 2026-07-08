@@ -79,7 +79,7 @@ struct ProcessesPageView: View {
             .padding(.leading, ProcessColumnLayout.pageInsetLeading)
             .padding(.trailing, ProcessColumnLayout.pageInsetTrailing)
             .onAppear(perform: updateSortedSections)
-            .onChange(of: monitor.processSections) { _, _ in updateSortedSections() }
+            .onChange(of: monitor.dataVersion) { _, _ in updateSortedSections() }
             .onChange(of: sortKey) { _, _ in updateSortedSections() }
             .onChange(of: ascending) { _, _ in updateSortedSections() }
         }

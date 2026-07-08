@@ -98,7 +98,7 @@ struct DetailsPageView: View {
             .padding(.leading, DetailsColumnLayout.insetLeading)
             .padding(.trailing, DetailsColumnLayout.insetTrailing)
             .onAppear(perform: updateSortedRows)
-            .onChange(of: monitor.detailProcessRows) { _, _ in updateSortedRows() }
+            .onChange(of: monitor.dataVersion) { _, _ in updateSortedRows() }
             .onChange(of: sortKey) { _, _ in updateSortedRows() }
             .onChange(of: ascending) { _, _ in updateSortedRows() }
         }
@@ -251,7 +251,7 @@ struct DetailsPageView: View {
     }
 
     private func toProcessRow(_ row: DetailProcessRowData) -> ProcessRowData {
-        let path = monitor.pidPath(pid: row.pid)
+        let path = SystemMonitor.pidPath(pid: row.pid)
         return ProcessRowData(
             pid: row.pid,
             name: row.name,

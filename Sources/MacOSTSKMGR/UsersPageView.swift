@@ -142,7 +142,7 @@ struct UsersPageView: View {
             .padding(.leading, UsersColumnLayout.insetLeading)
             .padding(.trailing, UsersColumnLayout.insetTrailing)
             .onAppear(perform: updateSortedRows)
-            .onChange(of: monitor.currentUserAppRows) { _, _ in updateSortedRows() }
+            .onChange(of: monitor.dataVersion) { _, _ in updateSortedRows() }
             .onChange(of: sortKey) { _, _ in updateSortedRows() }
             .onChange(of: ascending) { _, _ in updateSortedRows() }
         }

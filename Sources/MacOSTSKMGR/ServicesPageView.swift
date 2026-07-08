@@ -86,7 +86,7 @@ struct ServicesPageView: View {
             .onAppear {
                 updateSortedRows()
             }
-            .onChange(of: monitor.serviceRows) { _, _ in updateSortedRows() }
+            .onChange(of: monitor.dataVersion) { _, _ in updateSortedRows() }
             .onChange(of: sortKey) { _, _ in updateSortedRows() }
             .onChange(of: ascending) { _, _ in updateSortedRows() }
         }

@@ -1928,7 +1928,7 @@ struct RootWindowView: View {
 
     private func isFinderProcess(pid: Int32) -> Bool {
         let name = selectedProcessName(pid: pid).lowercased()
-        let path = monitor.pidPath(pid: pid).lowercased()
+        let path = SystemMonitor.pidPath(pid: pid).lowercased()
         return name == "finder" || name == "访达" || path.contains("/system/library/coreservices/finder.app")
     }
 
